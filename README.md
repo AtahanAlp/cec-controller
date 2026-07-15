@@ -48,7 +48,8 @@ git clone --recurse-submodules
 ```
 
 ## Building
-This project uses the 'normal' CMake based build.
+This project uses the 'normal' CMake based build.  
+The build depends on cmake (obviously), gcc-arm-none-eabi, and libnewlib-dev.
 
 Two boards are supported, and the RP2040 and RP2350 produce incompatible
 `.uf2` images, so build for the board you actually have:
@@ -71,7 +72,7 @@ Switching boards requires a clean build directory (`rm -rf build`).
 
 ### Customising the Build
 The CMake project supports three options:
-* PICO_BOARD: specify variant of Pico board, defaults to Seeed XIAO RP2350
+* PICO_BOARD: specify variant of Pico board, defaults to Seeed XIAO RP2350 (potential values [here](https://github.com/raspberrypi/pico-sdk/tree/master/src/boards/include/boards))
 * CEC_PIN: specify GPIO pin for HDMI CEC, defaults to GPIO3
 * CEC_OSD_NAME: specify the OSD string for HDMI input Pico-CEC is controlling, defaults to "Pico-CEC"
 Example invocation to specify:
