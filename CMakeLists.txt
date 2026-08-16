@@ -38,7 +38,6 @@ set(TCLI_SOURCE_DIR ${PROJECT_SOURCE_DIR}/tcli)
 
 set(CEC_PIN "11" CACHE STRING "GPIO pin for HDMI CEC.")
 set(PICO_CEC_VERSION "unknown" CACHE STRING "Pico-CEC version string.")
-set(KEYMAP_DEFAULT "KODI" CACHE STRING "Default keymap, specify KODI or MISTER.")
 set(CEC_OSD_NAME "Couch PC" CACHE STRING "OSD name for the CEC device (max 14 characters).")
 option(CEC_ENABLE_DDC "Enable 5 V HDMI DDC/EDID access through level shifting." OFF)
 option(CEC_ENABLE_RGB_LED "Enable a WS2812 status LED." OFF)
@@ -61,6 +60,7 @@ target_compile_options(tcli PRIVATE
 set(PICO_CEC_SOURCES
   src/blink.c
   src/cec-config.c
+  src/cec-control.c
   src/cec-frame.c
   src/cec-log.c
   src/cec-task.c
@@ -69,8 +69,8 @@ set(PICO_CEC_SOURCES
   src/main.c
   src/nvs.c
   src/usb-cdc.c
+  src/usb-device.c
   src/usb_descriptors.c
-  src/usb_hid.c
   src/util.c)
 
 set(PICO_CEC_LIBRARIES)
@@ -116,8 +116,7 @@ set_source_files_properties(src/nvs.c PROPERTIES COMPILE_DEFINITIONS
 
 # Undefine TinyUSB built-in OS, redefined in our tusb_config.h
 target_compile_options(${PROJECT} PRIVATE
-  -UCFG_TUSB_OS
-  -DKEYMAP_DEFAULT_${KEYMAP_DEFAULT}=1)
+  -UCFG_TUSB_OS)
 
 target_link_libraries(${PROJECT}
   crc

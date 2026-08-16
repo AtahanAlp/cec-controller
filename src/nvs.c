@@ -9,279 +9,100 @@
 #include "cec-config.h"
 #include "nvs.h"
 
-/**
- * Configuration header block, fixed size (40 bytes).
- *
- * Structure is packed to ensure checksum correctness.
- */
 typedef struct __attribute__((packed)) {
-  /** Version on the configuration body. */
   uint8_t version;
-  /** Length, in bytes, of the configuration body. */
   uint32_t length;
 } cec_config_header_nvs_t;
 
-/**
- * CEC configuration block NVS representation (version 1)
- *
- * Structure is packed to ensure checksum correctness.
- * Do not modify to ensure non-volatile storage compatibility.
- */
 typedef struct __attribute__((packed)) {
-  /** DDC EDID delay in milliseconds. */
   uint32_t edid_delay_ms;
-
-  /** CEC physical address. */
   uint16_t physical_address;
-
-  /** User Control key mapping table. */
-  uint8_t keymap[UINT8_MAX];
-} cec_config_nvs_v1_t;
-
-/**
- * CEC configuration block NVS representation (version 2)
- *
- * Structure is packed to ensure checksum correctness.
- * Do not modify to ensure non-volatile storage compatibility.
- */
-typedef struct __attribute__((packed)) {
-  /** DDC EDID delay in milliseconds. */
-  uint32_t edid_delay_ms;
-
-  /** CEC physical address. */
-  uint16_t physical_address;
-
-  /** CEC logical address (unused). */
   uint8_t logical_address;
-
-  /** CEC device type (unused). */
   uint8_t device_type;
-
-  /** Keymap. */
-  cec_config_keymap_t keymap_type;
-
-  /** User Control key mapping table. */
-  uint8_t keymap[UINT8_MAX];
-} cec_config_nvs_v2_t;
-
-/**
- * CEC configuration block NVS representation (current, v3).
- *
- * Structure is packed to ensure checksum correctness.
- */
-typedef struct __attribute__((packed)) {
-  /** DDC EDID delay in milliseconds. */
-  uint32_t edid_delay_ms;
-
-  /** CEC physical address. */
-  uint16_t physical_address;
-
-  /** CEC logical address (unused). */
-  uint8_t logical_address;
-
-  /** CEC device type (unused). */
-  uint8_t device_type;
-
-  /** Keymap. */
-  cec_config_keymap_t keymap_type;
-
-  /** CEC OSD name. */
   char osd_name[CEC_OSD_NAME_MAX_LEN + 1];
-
-  /** User Control key mapping table. */
-  uint8_t keymap[UINT8_MAX];
 } cec_config_nvs_t;
 
-/**
- * Serialised at-rest format.
- *
- * Structure is aligned to comply with requirement for page sized flash writes.
- */
 typedef struct __attribute__((aligned(FLASH_PAGE_SIZE))) {
-  /** Header. */
   cec_config_header_nvs_t header;
-
-  /** CRC32 of the header block. */
   uint32_t header_crc;
-
-  /** Configuration. */
   cec_config_nvs_t config;
-
-  /** CRC32 of the config block. */
   uint32_t config_crc;
 } pico_cec_nvs_t;
 
-// Symbols resolved from link script
 extern uint32_t CEC_NVS_BASE_ADDR[];
 extern uint32_t __CEC_NVS_LEN[];
 
 #define CEC_NVS_LEN ((uint32_t)(&__CEC_NVS_LEN))
 
-const uint8_t CEC_CONFIG_VERSION_01 = 0x01;
-const uint8_t CEC_CONFIG_VERSION_02 = 0x02;
-const uint8_t CEC_CONFIG_VERSION = 0x03;
-const size_t CEC_CONFIG_SIZE = sizeof(cec_config_t);
+static const uint8_t CEC_CONFIG_VERSION = 0x04;
 
 static uint32_t nvs_get_flash_address(void) {
   return ((uint32_t)CEC_NVS_BASE_ADDR - XIP_BASE);
 }
 
-/**
- * Migrate v1 config to current config.
- */
-static bool migrate_v1(const pico_cec_nvs_t *nvs, cec_config_t *config) {
-  if (crc32((unsigned char *)&nvs->config, sizeof(cec_config_nvs_v1_t)) == nvs->config_crc) {
-    cec_config_nvs_v1_t *configv1 = (cec_config_nvs_v1_t *)&nvs->config;
-    // deserialise and migrate
-    config->edid_delay_ms = configv1->edid_delay_ms;
-    config->physical_address = configv1->physical_address;
-    for (uint8_t n = 0; n < UINT8_MAX; n++) {
-      config->keymap[n].key = configv1->keymap[n];
-    }
-
-    return true;
+static bool load_config(const pico_cec_nvs_t *nvs, cec_config_t *config) {
+  if (nvs->header.length != sizeof(nvs->config)
+      || crc32((unsigned char *)&nvs->config, sizeof(nvs->config)) != nvs->config_crc) {
+    return false;
   }
 
-  return false;
-}
-
-/**
- * Migrate v2 config to current config.
- */
-static bool migrate_v2(const pico_cec_nvs_t *nvs, cec_config_t *config) {
-  if (crc32((unsigned char *)&nvs->config, sizeof(cec_config_nvs_v2_t)) == nvs->config_crc) {
-    cec_config_nvs_v2_t *configv2 = (cec_config_nvs_v2_t *)&nvs->config;
-    // deserialise and migrate
-    config->edid_delay_ms = configv2->edid_delay_ms;
-    config->physical_address = configv2->physical_address;
-    config->logical_address = configv2->logical_address;
-    config->device_type = configv2->device_type;
-    config->keymap_type = configv2->keymap_type;
-    for (uint8_t n = 0; n < UINT8_MAX; n++) {
-      config->keymap[n].key = configv2->keymap[n];
-    }
-
-    return true;
+  config->edid_delay_ms = nvs->config.edid_delay_ms;
+  config->physical_address = nvs->config.physical_address;
+  config->logical_address = nvs->config.logical_address;
+  config->device_type = nvs->config.device_type;
+  if (config->device_type == CEC_CONFIG_DEVICE_TYPE_TV) {
+    config->device_type = CEC_CONFIG_DEVICE_TYPE_PLAYBACK;
   }
-
-  return false;
-}
-
-/**
- * Load current config.
- */
-static bool load_config(pico_cec_nvs_t *nvs, cec_config_t *config) {
-  if (crc32((unsigned char *)&nvs->config, sizeof(nvs->config)) == nvs->config_crc) {
-    // deserialise
-    config->edid_delay_ms = nvs->config.edid_delay_ms;
-    config->physical_address = nvs->config.physical_address;
-    config->logical_address = nvs->config.logical_address;
-    config->device_type = nvs->config.device_type;
-    // hack to support previous unused setting
-    if (config->device_type == CEC_CONFIG_DEVICE_TYPE_TV) {
-      config->device_type = CEC_CONFIG_DEVICE_TYPE_PLAYBACK;
-    }
-    config->keymap_type = nvs->config.keymap_type;
-    for (uint8_t n = 0; n < UINT8_MAX; n++) {
-      config->keymap[n].key = nvs->config.keymap[n];
-    }
-    memcpy(config->osd_name, nvs->config.osd_name, sizeof(nvs->config.osd_name));
-
-    return true;
-  }
-
-  return false;
+  memcpy(config->osd_name, nvs->config.osd_name, sizeof(nvs->config.osd_name));
+  return true;
 }
 
 bool nvs_read_config(cec_config_t *config) {
-  bool success = false;
-
-  // flash is mmapped for read
-  pico_cec_nvs_t *cec_nvs = (pico_cec_nvs_t *)(CEC_NVS_BASE_ADDR);
-
-  // start with default config, then overlay from nvs
+  const pico_cec_nvs_t *nvs = (const pico_cec_nvs_t *)(CEC_NVS_BASE_ADDR);
   cec_config_set_default(config);
 
-  // read and check header/config CRCs
-  if (crc32((unsigned char *)&cec_nvs->header, sizeof(cec_nvs->header)) == cec_nvs->header_crc) {
-    if (cec_nvs->header.version == CEC_CONFIG_VERSION_01) {
-      success = migrate_v1(cec_nvs, config);
-    } else if (cec_nvs->header.version == CEC_CONFIG_VERSION_02) {
-      success = migrate_v2(cec_nvs, config);
-    } else if (cec_nvs->header.version == CEC_CONFIG_VERSION) {
-      success = load_config(cec_nvs, config);
-    }
+  if (crc32((unsigned char *)&nvs->header, sizeof(nvs->header)) != nvs->header_crc
+      || nvs->header.version != CEC_CONFIG_VERSION) {
+    return false;
   }
-
-  return success;
+  return load_config(nvs, config);
 }
 
 void nvs_load_config(cec_config_t *config) {
   nvs_read_config(config);
 
-  switch (config->keymap_type) {
-    case CEC_CONFIG_KEYMAP_KODI:
-    case CEC_CONFIG_KEYMAP_MISTER:
-      cec_config_set_keymap(config);
-      break;
-    case CEC_CONFIG_KEYMAP_CUSTOM:
-      // should already be loaded
-      break;
-    default:
-      break;
-  }
-
-  cec_config_complete(config);
-
-  // If empty, use default CEC OSD name.
   if (config->osd_name[0] == '\0') {
     strncpy(config->osd_name, CEC_OSD_NAME, CEC_OSD_NAME_MAX_LEN);
     config->osd_name[CEC_OSD_NAME_MAX_LEN] = '\0';
   }
-
-  return;
 }
 
 bool nvs_save_config(const cec_config_t *config) {
-  pico_cec_nvs_t cec_nvs = {0x0};
+  pico_cec_nvs_t nvs = {0};
 
-  if (sizeof(cec_nvs) > CEC_NVS_LEN) {
+  if (sizeof(nvs) > CEC_NVS_LEN) {
     return false;
   }
 
-  // serialise and checksum header
-  cec_nvs.header.version = CEC_CONFIG_VERSION;
-  cec_nvs.header.length = CEC_CONFIG_SIZE;
-  cec_nvs.header_crc = crc32((unsigned char *)&cec_nvs.header, sizeof(cec_nvs.header));
+  nvs.header.version = CEC_CONFIG_VERSION;
+  nvs.header.length = sizeof(nvs.config);
+  nvs.header_crc = crc32((unsigned char *)&nvs.header, sizeof(nvs.header));
 
-  // serialise and checksum config
-  cec_nvs.config.edid_delay_ms = config->edid_delay_ms;
-  cec_nvs.config.physical_address = config->physical_address;
-  cec_nvs.config.logical_address = config->logical_address;
-  cec_nvs.config.device_type = config->device_type;
-  cec_nvs.config.keymap_type = config->keymap_type;
+  nvs.config.edid_delay_ms = config->edid_delay_ms;
+  nvs.config.physical_address = config->physical_address;
+  nvs.config.logical_address = config->logical_address;
+  nvs.config.device_type = config->device_type;
+  memcpy(nvs.config.osd_name, config->osd_name, sizeof(nvs.config.osd_name));
+  nvs.config_crc = crc32((unsigned char *)&nvs.config, sizeof(nvs.config));
 
-  for (unsigned int n = 0; n < UINT8_MAX; n++) {
-    cec_nvs.config.keymap[n] = config->keymap[n].key;
-  }
+  unsigned int sectors = sizeof(nvs) / FLASH_SECTOR_SIZE;
+  unsigned int erase_size = sizeof(nvs) % FLASH_SECTOR_SIZE == 0
+                                ? sectors * FLASH_SECTOR_SIZE
+                                : (sectors + 1) * FLASH_SECTOR_SIZE;
 
-  memcpy(cec_nvs.config.osd_name, config->osd_name, sizeof(cec_nvs.config.osd_name));
-
-  cec_nvs.config_crc = crc32((unsigned char *)&cec_nvs.config, sizeof(cec_nvs.config));
-
-  // minimum number of flash sectors to erase in bytes
-  unsigned int n = sizeof(cec_nvs) / FLASH_SECTOR_SIZE;
-  unsigned int size = sizeof(cec_nvs) % FLASH_SECTOR_SIZE == 0 ? n * FLASH_SECTOR_SIZE
-                                                               : (n + 1) * FLASH_SECTOR_SIZE;
-
-  // interrupts must be disabled to safely program flash
   uint32_t irqs = save_and_disable_interrupts();
-  flash_range_erase(nvs_get_flash_address(), size);
-
-  // struct alignment should guarantee flash pages multiples
-  flash_range_program(nvs_get_flash_address(), (uint8_t *)&cec_nvs, sizeof(cec_nvs));
-
+  flash_range_erase(nvs_get_flash_address(), erase_size);
+  flash_range_program(nvs_get_flash_address(), (uint8_t *)&nvs, sizeof(nvs));
   restore_interrupts(irqs);
-
   return true;
 }

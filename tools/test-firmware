@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+builder_image="localhost/cec-controller-builder:fedora42"
+build_dir="/src/build/tests/firmware"
+
+podman build \
+  --file "$project_dir/tools/Containerfile" \
+  --tag "$builder_image" \
+  "$project_dir/tools"
+
+podman run --rm \
+  --security-opt label=disable \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --volume "$project_dir:/src" \
+  --workdir /src \
+  "$builder_image" \
+  cmake --fresh -S /src/tests/firmware -B "$build_dir" -G Ninja
+
+podman run --rm \
+  --security-opt label=disable \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --volume "$project_dir:/src" \
+  --workdir /src \
+  "$builder_image" \
+  cmake --build "$build_dir"
+
+podman run --rm \
+  --security-opt label=disable \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --volume "$project_dir:/src" \
+  --workdir /src \
+  "$builder_image" \
+  ctest --test-dir "$build_dir" --output-on-failure

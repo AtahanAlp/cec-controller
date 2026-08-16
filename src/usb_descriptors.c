@@ -23,7 +23,9 @@
  *
  */
 
-#include "usb_descriptors.h"
+#include <string.h>
+
+#include "pico/unique_id.h"
 #include "tusb.h"
 
 /* A combination of interfaces must have a unique product id, since PC will save device driver after
@@ -79,28 +81,12 @@ uint8_t const *tud_descriptor_device_cb(void) {
 }
 
 //--------------------------------------------------------------------+
-// HID Report Descriptor
-//--------------------------------------------------------------------+
-
-uint8_t const desc_hid_report[] = {TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))};
-
-// Invoked when received GET HID REPORT DESCRIPTOR
-// Application return pointer to descriptor
-// Descriptor contents must exist long enough for transfer to complete
-uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
-  (void)instance;
-  return desc_hid_report;
-}
-
-//--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
 
-enum { ITF_NUM_HID, ITF_NUM_CDC, ITF_NUM_CDC_DATA, ITF_NUM_TOTAL };
+enum { ITF_NUM_CDC, ITF_NUM_CDC_DATA, ITF_NUM_TOTAL };
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
-
-#define EPNUM_HID 0x84
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
@@ -108,18 +94,8 @@ uint8_t const desc_configuration[] = {
                           ITF_NUM_TOTAL,
                           0,
                           CONFIG_TOTAL_LEN,
-                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP,
+                          0,
                           100),
-
-    // Interface number, string index, protocol, report descriptor len, EP In address, size &
-    // polling interval
-    TUD_HID_DESCRIPTOR(ITF_NUM_HID,
-                       0,
-                       HID_ITF_PROTOCOL_NONE,
-                       sizeof(desc_hid_report),
-                       EPNUM_HID,
-                       CFG_TUD_HID_EP_BUFSIZE,
-                       5),
 
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC,
                        USBD_STR_CDC,
@@ -192,13 +168,14 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 // array of pointer to string descriptors
 char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: is supported language is English (0x0409)
-    "TinyUSB",                   // 1: Manufacturer
-    "TinyUSB Device",            // 2: Product
-    "123456",                    // 3: Serials, should use chip ID
-    "Pico-CEC Console",          // 4: stdio
+    "Couch CEC",                 // 1: Manufacturer
+    "Couch CEC Controller",      // 2: Product
+    NULL,                         // 3: Serial, generated from the RP2040 ID
+    "Couch CEC Console",         // 4: CDC interface
 };
 
 static uint16_t _desc_str[32];
+static char serial[PICO_UNIQUE_BOARD_ID_SIZE_BYTES * 2 + 1];
 
 // Invoked when received GET STRING DESCRIPTOR request
 // Application return pointer to descriptor, whose contents must exist long enough for transfer to
@@ -219,6 +196,10 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
       return NULL;
 
     const char *str = string_desc_arr[index];
+    if (index == 3) {
+      pico_get_unique_board_id_string(serial, sizeof(serial));
+      str = serial;
+    }
 
     // Cap at max char
     chr_count = (uint8_t)strlen(str);

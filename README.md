@@ -62,14 +62,17 @@ be tuned on the target TV rather than assumed from its unknown model number.
 
 See [docs/PLAN.md](docs/PLAN.md) for the staged implementation and acceptance
 gates, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the protocol and host
-integration design, and [docs/BUILD.md](docs/BUILD.md) for the reproducible
-firmware build and baseline smoke test.
+integration design, [docs/BUILD.md](docs/BUILD.md) for the reproducible
+firmware build and baseline smoke test, and [docs/PROTOCOL.md](docs/PROTOCOL.md)
+for the versioned USB commands.
 
 ## Project state
 
-The safe original-Pico baseline is buildable. Nothing should be connected to
-the TV until the wiring is continuity-checked and the firmware image has been
-flashed and inspected over USB.
+The purpose-built original-Pico firmware and `CECCTRL/1` USB protocol are
+buildable, and the native command-sequence tests pass. TV behavior is not yet
+validated. Nothing should be connected to the TV until the wiring is
+continuity-checked and the firmware image has been flashed and inspected over
+USB.
 
 ## Upstream and license
 

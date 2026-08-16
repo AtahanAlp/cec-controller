@@ -4,15 +4,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "cec-message.h"
+
 #ifndef CEC_PIN
 #define CEC_PIN 3  // GPIO3 == D10 (Seeed Studio XIAO RP2040)
 #endif
-
-/* Maximum length of CEC frame in bytes. */
-#define CEC_FRAME_MAX_LEN (16)
-
-/* Maximum length of CEC frame operand in bytes. */
-#define CEC_FRAME_MAX_OPERAND_LEN (CEC_FRAME_MAX_LEN - 2)
 
 extern TaskHandle_t xCECTask;
 
@@ -22,21 +18,6 @@ extern TaskHandle_t xCECTask;
 #define NOTIFY_RX_RX (1UL << 0)
 #define NOTIFY_RX_ABORT (1UL << 1)
 #define NOTIFY_RX_TX (1UL << 2)
-
-/* Construct the frame address header. */
-#define HEADER0(iaddr, daddr) ((iaddr << 4) | daddr)
-
-typedef struct __attribute__((packed)) {
-  union {
-    struct {
-      uint8_t header;
-      uint8_t opcode;
-      uint8_t operand[CEC_FRAME_MAX_OPERAND_LEN];
-    };
-    uint8_t data[CEC_FRAME_MAX_LEN];
-  };
-  uint8_t len;
-} cec_message_t;
 
 typedef enum {
   CEC_FRAME_STATE_START_LOW = 0,
@@ -71,11 +52,12 @@ typedef struct {
   uint32_t tx_frames;
   uint32_t rx_abort_frames;
   uint32_t tx_noack_frames;
+  uint32_t tx_timeout_frames;
 } cec_frame_stats_t;
 
 void cec_frame_init(void);
 void cec_frame_get_stats(cec_frame_stats_t *stats);
-bool cec_frame_send(const cec_message_t *message);
+cec_tx_result_t cec_frame_send(const cec_message_t *message);
 void cec_frame_recv(cec_message_t *message, uint8_t address);
 
 #endif

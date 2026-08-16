@@ -1,10 +1,10 @@
+#include <string.h>
+
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
 
-#include "class/hid/hid.h"
 #include "pico/stdlib.h"
-#include "tusb.h"
 
 #include "blink.h"
 #include "cec-config.h"
@@ -15,16 +15,11 @@
 #include "ddc.h"
 #include "nvs.h"
 
-/* Intercept HDMI CEC commands, convert to a keypress and send to HID task
- * handler.
- *
- * Significantly rewritten from the initial Arduino version by Szymon Slupik:
+/* Significantly rewritten from the initial Arduino version by Szymon Slupik:
  * https://github.com/SzymonSlupik/CEC-Tiny-Pro
  * which itself is based on the original code by Thomas Sowell:
  * https://github.com/tsowell/avr-hdmi-cec-volume/tree/master
  */
-
-#define CEC_MSG_QUEUE_LENGTH (8)
 
 /** The running CEC configuration. */
 static cec_config_t config = {0x0};
@@ -55,11 +50,19 @@ static uint16_t active_addr = 0x0000;
 /* Audio state. */
 static bool audio_status = false;
 
-/* Outbound TX queue: holds CEC messages to be sent. */
+typedef struct {
+  cec_message_t message;
+  TaskHandle_t requester;
+} cec_tx_request_t;
+
+/* Outbound TX queue: holds one synchronous request at a time. */
 #define CEC_TX_QUEUE_LEN 1
+#define CEC_CLIENT_NOTIFY_TX ((UBaseType_t)0)
+#define CEC_CLIENT_NOTIFY_POWER ((UBaseType_t)1)
 static QueueHandle_t cec_tx_queue = NULL;
 static StaticQueue_t cec_tx_queue_buf;
-static uint8_t cec_tx_queue_storage[CEC_TX_QUEUE_LEN * sizeof(cec_message_t)];
+static uint8_t cec_tx_queue_storage[CEC_TX_QUEUE_LEN * sizeof(cec_tx_request_t)];
+static TaskHandle_t power_status_waiter = NULL;
 
 static void cec_feature_abort(uint8_t initiator,
                               uint8_t destination,
@@ -169,7 +172,7 @@ static void report_cec_version(uint8_t initiator, uint8_t destination) {
   cec_frame_send(&message);
 }
 
-bool cec_ping(uint8_t destination) {
+static cec_tx_result_t cec_ping(uint8_t destination) {
   cec_message_t message = {
       .header = HEADER0(destination, destination),
       .len = 1,
@@ -177,16 +180,30 @@ bool cec_ping(uint8_t destination) {
   return cec_frame_send(&message);
 }
 
-bool cec_send_msg(const cec_message_t *msg) {
+cec_tx_result_t cec_send_msg_sync(const cec_message_t *msg, uint32_t timeout_ms) {
   if (cec_tx_queue == NULL) {
-    return false;
+    return CEC_TX_UNAVAILABLE;
   }
 
-  if (xQueueSend(cec_tx_queue, msg, pdMS_TO_TICKS(10)) != pdTRUE) {
-    return false;
+  cec_tx_request_t request = {
+      .message = *msg,
+      .requester = xTaskGetCurrentTaskHandle(),
+  };
+  xTaskNotifyStateClearIndexed(NULL, CEC_CLIENT_NOTIFY_TX);
+  if (xQueueSend(cec_tx_queue, &request, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return CEC_TX_UNAVAILABLE;
   }
   xTaskNotifyIndexed(xCECTask, NOTIFY_RX, NOTIFY_RX_TX, eSetBits);
-  return true;
+
+  uint32_t result = CEC_TX_UNAVAILABLE;
+  if (xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_TX,
+                             0,
+                             UINT32_MAX,
+                             &result,
+                             pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    return CEC_TX_TIMEOUT;
+  }
+  return (cec_tx_result_t)result;
 }
 
 static void image_view_on(uint8_t initiator, uint8_t destination) {
@@ -232,7 +249,12 @@ static uint8_t allocate_logical_address(cec_config_t *config) {
   for (unsigned int i = 0; i < NUM_LADDRESS; i++) {
     a = laddress[config->device_type][i];
     cec_log_submitf("Attempting to allocate logical address 0x%01hhx"_LOG_BR, a);
-    if (!cec_ping(a)) {
+    cec_tx_result_t result = cec_ping(a);
+    if (result == CEC_TX_NO_ACK) {
+      break;
+    }
+    if (result == CEC_TX_TIMEOUT) {
+      a = 0x0f;
       break;
     }
   }
@@ -241,7 +263,7 @@ static uint8_t allocate_logical_address(cec_config_t *config) {
   return a;
 }
 
-uint16_t get_physical_address(const cec_config_t *config) {
+static uint16_t get_physical_address(const cec_config_t *config) {
   return (config->physical_address == 0x0000) ? ddc_get_physical_address()
                                               : config->physical_address;
 }
@@ -254,8 +276,60 @@ uint8_t cec_get_logical_address(void) {
   return laddr;
 }
 
+void cec_set_physical_address(uint16_t physical_address) {
+  taskENTER_CRITICAL();
+  config.physical_address = physical_address;
+  paddr = physical_address;
+  taskEXIT_CRITICAL();
+}
+
+cec_power_query_result_t cec_query_power_status(uint8_t *power_status, uint32_t timeout_ms) {
+  if (power_status == NULL) {
+    return CEC_POWER_QUERY_UNAVAILABLE;
+  }
+
+  TaskHandle_t current = xTaskGetCurrentTaskHandle();
+  xTaskNotifyStateClearIndexed(NULL, CEC_CLIENT_NOTIFY_POWER);
+  taskENTER_CRITICAL();
+  power_status_waiter = current;
+  taskEXIT_CRITICAL();
+
+  cec_message_t query = {
+      .header = HEADER0(laddr, 0x00),
+      .opcode = CEC_ID_GIVE_DEVICE_POWER_STATUS,
+      .len = 2,
+  };
+  cec_tx_result_t tx = cec_send_msg_sync(&query, CEC_CONTROL_TX_TIMEOUT_MS);
+  if (tx != CEC_TX_ACK) {
+    taskENTER_CRITICAL();
+    if (power_status_waiter == current) {
+      power_status_waiter = NULL;
+    }
+    taskEXIT_CRITICAL();
+    if (tx == CEC_TX_NO_ACK) {
+      return CEC_POWER_QUERY_NO_ACK;
+    }
+    return tx == CEC_TX_TIMEOUT ? CEC_POWER_QUERY_TX_TIMEOUT : CEC_POWER_QUERY_UNAVAILABLE;
+  }
+
+  uint32_t result = 0;
+  BaseType_t received = xTaskNotifyWaitIndexed(
+      CEC_CLIENT_NOTIFY_POWER, 0, UINT32_MAX, &result, pdMS_TO_TICKS(timeout_ms));
+  taskENTER_CRITICAL();
+  if (power_status_waiter == current) {
+    power_status_waiter = NULL;
+  }
+  taskEXIT_CRITICAL();
+  if (received != pdTRUE || result == 0) {
+    return CEC_POWER_QUERY_RESPONSE_TIMEOUT;
+  }
+
+  *power_status = (uint8_t)(result - 1);
+  return CEC_POWER_QUERY_OK;
+}
+
 void cec_task(void *param) {
-  QueueHandle_t *q = (QueueHandle_t *)param;
+  (void)param;
 
   /* Menu state. */
   bool menu_state = false;
@@ -263,8 +337,8 @@ void cec_task(void *param) {
   // load configuration
   nvs_load_config(&config);
 
-  cec_tx_queue = xQueueCreateStatic(CEC_TX_QUEUE_LEN, sizeof(cec_message_t), cec_tx_queue_storage,
-                                    &cec_tx_queue_buf);
+  cec_tx_queue = xQueueCreateStatic(CEC_TX_QUEUE_LEN, sizeof(cec_tx_request_t),
+                                    cec_tx_queue_storage, &cec_tx_queue_buf);
 
   // pause for EDID to settle
   vTaskDelay(pdMS_TO_TICKS(config.edid_delay_ms));
@@ -273,17 +347,20 @@ void cec_task(void *param) {
 
   paddr = get_physical_address(&config);
   laddr = allocate_logical_address(&config);
+  uint8_t no_active = 0;
 
   while (true) {
     cec_message_t msg = {0x0};
-    uint8_t key = HID_KEY_NONE;
-    uint8_t no_active = 0;
 
     cec_frame_recv(&msg, laddr);
 
-    cec_message_t tx_msg;
-    if (xQueueReceive(cec_tx_queue, &tx_msg, 0) == pdTRUE) {
-      cec_frame_send(&tx_msg);
+    cec_tx_request_t tx_request;
+    if (xQueueReceive(cec_tx_queue, &tx_request, 0) == pdTRUE) {
+      cec_tx_result_t result = cec_frame_send(&tx_request.message);
+      xTaskNotifyIndexed(tx_request.requester,
+                         CEC_CLIENT_NOTIFY_TX,
+                         (uint32_t)result,
+                         eSetValueWithOverwrite);
       continue;
     }
 
@@ -404,6 +481,19 @@ void cec_task(void *param) {
 #endif
           break;
         case CEC_ID_REPORT_POWER_STATUS:
+          if (initiator == 0x00 && destination == laddr && msg.len >= 3) {
+            TaskHandle_t waiter = NULL;
+            taskENTER_CRITICAL();
+            waiter = power_status_waiter;
+            power_status_waiter = NULL;
+            taskEXIT_CRITICAL();
+            if (waiter != NULL) {
+              xTaskNotifyIndexed(waiter,
+                                 CEC_CLIENT_NOTIFY_POWER,
+                                 (uint32_t)msg.operand[0] + 1,
+                                 eSetValueWithOverwrite);
+            }
+          }
           break;
         case CEC_ID_GET_MENU_LANGUAGE:
           break;
@@ -429,17 +519,11 @@ void cec_task(void *param) {
         case CEC_ID_USER_CONTROL_PRESSED:
           if (destination == laddr) {
             blink_set(BLINK_STATE_GREEN_ON);
-            command_t command = config.keymap[msg.operand[0]];
-            if (command.name != NULL) {
-              xQueueSend(*q, &command.key, pdMS_TO_TICKS(10));
-            }
           }
           break;
         case CEC_ID_USER_CONTROL_RELEASED:
           if (destination == laddr) {
             blink_set(BLINK_STATE_OFF);
-            key = HID_KEY_NONE;
-            xQueueSend(*q, &key, pdMS_TO_TICKS(10));
           }
           break;
         case CEC_ID_ABORT:

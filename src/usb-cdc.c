@@ -10,9 +10,9 @@
 #include "pico-cec/util.h"
 
 #include "cec-frame.h"
+#include "cec-control.h"
 #include "cec-log.h"
 #include "cec-task.h"
-#include "ddc.h"
 #include "nvs.h"
 #include "tclie.h"
 #include "usb-cdc.h"
@@ -23,6 +23,36 @@
 static cec_config_t config = {0x0};
 
 static tclie_t tclie;
+
+static cec_tx_result_t control_send(void *context,
+                                    const cec_message_t *message,
+                                    uint32_t timeout_ms) {
+  (void)context;
+  return cec_send_msg_sync(message, timeout_ms);
+}
+
+static void control_delay(void *context, uint32_t delay_ms) {
+  (void)context;
+  vTaskDelay(pdMS_TO_TICKS(delay_ms));
+}
+
+static cec_power_query_result_t control_query_power(void *context,
+                                                    uint8_t initiator,
+                                                    uint8_t *power_status,
+                                                    uint32_t timeout_ms) {
+  (void)context;
+  if (initiator != cec_get_logical_address()) {
+    return CEC_POWER_QUERY_UNAVAILABLE;
+  }
+  return cec_query_power_status(power_status, timeout_ms);
+}
+
+static const cec_control_bus_t control_bus = {
+    .context = NULL,
+    .send = control_send,
+    .delay = control_delay,
+    .query_power = control_query_power,
+};
 
 /** Print string to CDC output. */
 static void print(const char *str) {
@@ -145,20 +175,6 @@ static int show_config(cec_config_t *config) {
   }
   cdc_printfln("%-17s: %s", "Device type", type);
 
-  const char *keymap = "unknown";
-  switch (config->keymap_type) {
-    case CEC_CONFIG_KEYMAP_CUSTOM:
-      keymap = "custom";
-      break;
-    case CEC_CONFIG_KEYMAP_KODI:
-      keymap = "Kodi";
-      break;
-    case CEC_CONFIG_KEYMAP_MISTER:
-      keymap = "MiSTer";
-      break;
-  }
-  cdc_printfln("%-17s: %s", "Keymap", keymap);
-
   print_osd_name(config->osd_name);
 
   return 0;
@@ -171,6 +187,7 @@ static int show_stats_cec(void) {
   cdc_printfln("%-13s: %lu frames", "CEC tx", stats.tx_frames);
   cdc_printfln("%-13s: %lu frames", "CEC rx abort", stats.rx_abort_frames);
   cdc_printfln("%-13s: %lu frames", "CEC tx noack", stats.tx_noack_frames);
+  cdc_printfln("%-13s: %lu frames", "CEC tx timeout", stats.tx_timeout_frames);
 
   return 0;
 }
@@ -220,12 +237,6 @@ static int exec_show(void *arg, int argc, const char **argv) {
   if (argc == 2) {
     if (strcmp(argv[1], "config") == 0) {
       return show_config(&config);
-    } else if (strcmp(argv[1], "keymap") == 0) {
-      for (uint8_t n = 0; n < UINT8_MAX; n++) {
-        if (config.keymap[n].name != NULL) {
-          cdc_printfln(" 0x%02x : %02u : %s", n, config.keymap[n].key, config.keymap[n].name);
-        }
-      }
     } else if (strcmp(argv[1], "cec") == 0) {
       print_physical_address(cec_get_physical_address());
       print_logical_address(cec_get_logical_address());
@@ -255,17 +266,6 @@ static int exec_show(void *arg, int argc, const char **argv) {
   return -1;
 }
 
-static int exec_query(void *arg, int argc, const char **argv) {
-  if (argc == 2) {
-    if (strcmp(argv[1], "edid") == 0) {
-      print_physical_address(ddc_get_physical_address());
-      return -1;
-    }
-  }
-
-  return 0;
-}
-
 static int exec_save(void *arg, int argc, const char **argv) {
   // UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
   // cdc_printfln("StackHighWaterMark = %lu", uxHighWaterMark);
@@ -286,6 +286,7 @@ static int exec_set(void *arg, int argc, const char **argv) {
         return 0;
       } else if (strcmp(argv[2], "physical_address") == 0) {
         if (sscanf(argv[3], "%4hx", &config.physical_address) == 1) {
+          cec_set_physical_address(config.physical_address);
           print_physical_address(config.physical_address);
           return 0;
         } else {
@@ -330,52 +331,78 @@ static int exec_set(void *arg, int argc, const char **argv) {
         return 0;
       }
     }
-  } else if (argc >= 3) {
-    if (strcmp(argv[1], "keymap") == 0) {
-      const char *param = argv[2];
-      if (strcmp(param, "kodi") == 0) {
-        config.keymap_type = CEC_CONFIG_KEYMAP_KODI;
-        cec_config_set_keymap(&config);
-        return 0;
-      } else if (strcmp(param, "mister") == 0) {
-        config.keymap_type = CEC_CONFIG_KEYMAP_MISTER;
-        cec_config_set_keymap(&config);
-        return 0;
-      } else if (strcmp(param, "custom") == 0) {
-        if (argc == 5) {
-          const char *cec_str = argv[3];
-          const char *hid_str = argv[4];
-          unsigned int cec_in = 0;
-          unsigned int hid_in = 0;
-          int n = sscanf(cec_str, "%x", &cec_in);
-          if ((n != 1) || (cec_in > UINT8_MAX)) {
-            cdc_printfln("Error parsing custom keymap CEC code");
-            return -1;
-          }
-          n = sscanf(hid_str, "%x", &hid_in);
-          if ((n != 1) || (hid_in > UINT8_MAX)) {
-            cdc_printfln("Error parsing custom keymap HID code");
-            return -1;
-          }
-
-          if ((cec_in <= UINT8_MAX) && (hid_in <= UINT8_MAX)) {
-            cec_config_set_user_keymap(&config, (uint8_t)cec_in, (uint8_t)hid_in);
-          }
-        } else {
-          cdc_printfln("Error parsing custom keymap");
-          return -1;
-        }
-      } else {
-        cdc_printfln("Unknown keymap '%s'", argv[2]);
-        return -1;
-      }
-    }
   }
 
   return -1;
 }
 
+static const char *tx_result_name(cec_tx_result_t result) {
+  switch (result) {
+    case CEC_TX_ACK:
+      return "ack";
+    case CEC_TX_NO_ACK:
+      return "no_ack";
+    case CEC_TX_TIMEOUT:
+      return "timeout";
+    case CEC_TX_UNAVAILABLE:
+    default:
+      return "unavailable";
+  }
+}
+
+static int exec_tv(void *arg, int argc, const char **argv) {
+  (void)arg;
+  if (argc != 2) {
+    return -1;
+  }
+
+  if (strcmp(argv[1], "protocol") == 0) {
+    cdc_printfln("CECCTRL/%u OK command=protocol firmware=%s",
+                 CEC_CONTROL_PROTOCOL_VERSION,
+                 PICO_CEC_VERSION);
+    return 0;
+  }
+
+  cec_control_result_t result;
+  const char *command = argv[1];
+  if (strcmp(command, "on") == 0) {
+    result = cec_control_on(&control_bus,
+                            cec_get_logical_address(),
+                            cec_get_physical_address(),
+                            config.device_type);
+  } else if (strcmp(command, "standby") == 0) {
+    result = cec_control_standby(&control_bus, cec_get_logical_address());
+  } else if (strcmp(command, "status") == 0) {
+    result = cec_control_status(&control_bus, cec_get_logical_address());
+  } else {
+    return -1;
+  }
+
+  if (result.code == CEC_CONTROL_OK) {
+    if (strcmp(command, "status") == 0) {
+      cdc_printfln("CECCTRL/%u OK command=status power=%s value=%u",
+                   CEC_CONTROL_PROTOCOL_VERSION,
+                   cec_control_power_name(result.power_status),
+                   result.power_status);
+    } else {
+      cdc_printfln("CECCTRL/%u OK command=%s attempts=%u",
+                   CEC_CONTROL_PROTOCOL_VERSION,
+                   command,
+                   result.attempts);
+    }
+    return 0;
+  }
+
+  cdc_printfln("CECCTRL/%u ERR command=%s code=%s attempts=%u",
+               CEC_CONTROL_PROTOCOL_VERSION,
+               command,
+               cec_control_result_name(result.code),
+               result.attempts);
+  return -1;
+}
+
 static int exec_send(void *arg, int argc, const char **argv) {
+  (void)arg;
   if (argc >= 3) {
     unsigned int address = 0;
     unsigned int opcode = 0;
@@ -398,10 +425,18 @@ static int exec_send(void *arg, int argc, const char **argv) {
         }
       }
 
-      if (cec_send_msg(&msg)) {
+      cec_tx_result_t result = cec_send_msg_sync(&msg, CEC_CONTROL_TX_TIMEOUT_MS);
+      bool success = address == 0x0f ? result == CEC_TX_ACK || result == CEC_TX_NO_ACK
+                                     : result == CEC_TX_ACK;
+      if (success) {
+        cdc_printfln("CECCTRL/%u OK command=send result=%s",
+                     CEC_CONTROL_PROTOCOL_VERSION,
+                     tx_result_name(result));
         return 0;
       }
-      cdc_printfln("Send failed (queue full)");
+      cdc_printfln("CECCTRL/%u ERR command=send code=%s",
+                   CEC_CONTROL_PROTOCOL_VERSION,
+                   tx_result_name(result));
       return -1;
     }
     cdc_printfln("Error parsing opcode");
@@ -411,15 +446,15 @@ static int exec_send(void *arg, int argc, const char **argv) {
 
 static const tclie_cmd_t cmds[] = {
     {"debug", exec_debug, "Control debug output.", "debug {on|off}"},
-    {"query", exec_query, "Query information.", "query {edid}"},
     {"save", exec_save, "Save configuration.", "save"},
     {"send", exec_send, "Send a CEC opcode.",
      "send <addr> <opcode> [<operand>] [<operand>] [<operand>]"},
     {"set", exec_set, "Set configuration parameters.",
      "set {(config (edid_delay_ms|logical_address|physical_address|osd_name <value>)|(device_type "
-     "{playback|recording}))|(keymap ({kodi|mister}|(custom <cec> <hid>)))}"},
+     "{playback|recording}))}"},
     {"show", exec_show, "Show information.",
-     "show {cec|config|keymap|nvs|(stats {cec|cpu|tasks})|version}"},
+     "show {cec|config|nvs|(stats {cec|cpu|tasks})|version}"},
+    {"tv", exec_tv, "Control or query the TV.", "tv {on|standby|status|protocol}"},
     {"reboot", exec_reboot, "Reboot system.", "reboot [bootsel]"},
 };
 

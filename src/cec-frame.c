@@ -9,6 +9,9 @@
 
 TaskHandle_t xCECTask;
 
+#define CEC_BUS_IDLE_TIMEOUT_MS (1000)
+#define CEC_FRAME_TX_TIMEOUT_MS (100)
+
 static cec_message_t rx_message = {.data = {0x0}, .len = 0};
 static cec_frame_t rx_frame = {.message = &rx_message};
 
@@ -246,12 +249,17 @@ static int64_t frame_tx_callback(alarm_id_t alarm, void *user_data) {
   }
 }
 
-static bool frame_tx(const cec_message_t *message) {
+static cec_tx_result_t frame_tx(const cec_message_t *message) {
   unsigned char i = 0;
+  TickType_t idle_start = xTaskGetTickCount();
 
   // wait 7 bit times of idle before sending
   while (i < 7) {
-    vTaskDelay(pdMS_TO_TICKS(2.4));
+    if ((xTaskGetTickCount() - idle_start) >= pdMS_TO_TICKS(CEC_BUS_IDLE_TIMEOUT_MS)) {
+      cec_stats.tx_timeout_frames++;
+      return CEC_TX_TIMEOUT;
+    }
+    vTaskDelay(pdMS_TO_TICKS(3));
     if (gpio_get(CEC_PIN)) {
       i++;
     } else {
@@ -266,21 +274,31 @@ static bool frame_tx(const cec_message_t *message) {
                        .start = 0,
                        .ack = false,
                        .state = CEC_FRAME_STATE_START_LOW};
-  add_alarm_at(from_us_since_boot(time_us_64()), frame_tx_callback, &frame, true);
-  ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE, portMAX_DELAY);
+  ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE, 0);
+  alarm_id_t alarm =
+      add_alarm_at(from_us_since_boot(time_us_64()), frame_tx_callback, &frame, true);
+  if (alarm < 0
+      || ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE, pdMS_TO_TICKS(CEC_FRAME_TX_TIMEOUT_MS)) == 0) {
+    if (alarm >= 0) {
+      cancel_alarm(alarm);
+    }
+    gpio_set_dir(CEC_PIN, GPIO_IN);
+    cec_stats.tx_timeout_frames++;
+    return CEC_TX_TIMEOUT;
+  }
   // printf("high water mark = %lu\n", uxTaskGetStackHighWaterMark(xCECTask));
   cec_log_frame(&frame, false);
 
   if (frame.ack) {
     cec_stats.tx_frames++;
+    return CEC_TX_ACK;
   } else {
     cec_stats.tx_noack_frames++;
+    return CEC_TX_NO_ACK;
   }
-
-  return frame.ack;
 }
 
-bool cec_frame_send(const cec_message_t *message) {
+cec_tx_result_t cec_frame_send(const cec_message_t *message) {
   // disable GPIO ISR for sending
   gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
   return frame_tx(message);

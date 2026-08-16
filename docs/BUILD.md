@@ -38,7 +38,7 @@ The configured baseline is:
 | --- | --- |
 | Board | original Raspberry Pi Pico / RP2040 |
 | CEC GPIO | GP11, physical Pico pin 15 |
-| USB | CDC shell plus upstream HID interface |
+| USB | CDC controller with chip-unique serial number |
 | Device type | Playback Device |
 | Logical address | automatic, preferring 4 then 8 then 11 |
 | Physical address | manual, initially unset (`0.0.0.0`) |
@@ -75,13 +75,13 @@ Enter these commands one line at a time:
 show version
 show config
 set config physical_address 1000
-set config edid_delay_ms 0
 save
-reboot
+tv protocol
 ```
 
-Reconnect the terminal after reboot and confirm that the running configuration
-is no longer `0.0.0.0`:
+The physical address takes effect immediately. `save` is optional for the later
+automatic host workflow, but useful during manual bring-up. Confirm that the
+running configuration is no longer `0.0.0.0`:
 
 ```text
 show cec
@@ -92,24 +92,32 @@ show nvs
 
 Only after the cut cable has passed continuity and short-circuit checks,
 connect it to the TV's spare HDMI input. With an allocated Playback Device
-logical address, these raw commands test the planned Samsung sequence for a
-PC video physical address of `1.0.0.0`:
+logical address, the purpose-built command runs the Samsung sequence:
 
 ```text
-send f 84 10 00 04
-send 0 04
-send f 82 10 00
-show stats cec
+tv on
+tv status
 ```
 
-Allow roughly 1.5 seconds between `send 0 04` and `send f 82 10 00` during the
-manual test. To request standby:
+To request standby:
 
 ```text
-send 0 36
+tv standby
 show stats cec
 ```
 
 An incrementing `CEC tx noack` count is useful evidence, not a reason to add
 more HDMI wires blindly. Record it alongside the TV behavior before moving to
 a fallback.
+
+The raw `send` command remains available for individual-frame diagnosis. The
+normal reply format and error codes are documented in
+[PROTOCOL.md](PROTOCOL.md).
+
+## Tests
+
+Run the native sequence tests independently of the firmware build:
+
+```sh
+./tools/test-firmware
+```
