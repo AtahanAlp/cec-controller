@@ -1,256 +1,77 @@
-# Pico-CEC
+# Couch CEC Controller
 
-A Raspberry Pi Pico based project to bridge HDMI CEC (Consumer Electronics
-Control) and USB HID keyboard control (especially for use with Kodi).
+An RP2040-based HDMI-CEC bridge that makes a Samsung TV behave like the
+monitor of a Bazzite couch PC. The PC sends small commands over USB; a
+Raspberry Pi Pico transmits the corresponding CEC messages to the TV.
 
-![Fully assembled Pico-CEC.](https://github.com/user-attachments/assets/7b971a8d-e5fd-4bc1-8ff5-a342004288a5)
+The primary behavior is deliberately narrow:
 
-## Update January 2026
+- wake the TV and select the PC's HDMI input when the PC boots or resumes;
+- put the TV in standby before the PC suspends or shuts down;
+- require no continuously running host daemon.
 
-The reference hardware for `pico-cec` has been upgraded from RP2040 to RP2350. Support for RP2040 builds will continue where possible.
+Volume and other remote-replacement controls can be added after the power and
+input-selection path is reliable.
 
-## Motivation
+## Initial topology
 
-Micro/mini desktops are plentiful as second hand, budget friendly media players,
-especially when installed with Kodi (eg. LibreELEC).
-However, many of these devices do not support HDMI-CEC and require the user to
-use additional peripherals (eg. wireless keyboard, game controller).
+The first prototype uses two independent TV HDMI inputs:
 
-In this project we use a Pico to both:
-* handle the CEC protocol on the HDMI port
-* adapt the user control messages into USB keyboard inputs
+```text
+PC GPU ---------------- normal HDMI cable ----------------> TV video input
+   |
+   +-- USB --> Raspberry Pi Pico --> CEC-only HDMI cable --> TV spare input
+```
 
-## What Works
-* HDMI CEC frame send and receive
-* EDID parsing to determine HDMI physical address
-* LibreELEC recognises Pico-CEC as an USB HID keyboard
-* HDMI CEC basic user control messages are properly mapped to Kodi shortcuts,
-  including:
-   * navigations arrows
-   * select
-   * back
-   * play
-   * pause
-   * numbers 0-9
- 
+Only these conductors are required in the CEC-only cable:
+
+| HDMI pin | Signal | Pico connection |
+| --- | --- | --- |
+| 13 | CEC | Configured 3.3 V GPIO |
+| 17 | DDC/CEC ground | GND |
+
+DDC pins 15 and 16 are intentionally disconnected in the first prototype.
+The host can obtain the physical address of the real video connection from
+the GPU connector's EDID and pass it to the Pico over USB. Reading EDID on the
+spare CEC-only input would identify the wrong HDMI port.
+
 > [!CAUTION]
-> The build quality of the HDMI breakout boards is highly variable, thus pass through of 4K video may not function in all circumstances.
+> RP2040 GPIO is not 5 V tolerant. Do not connect HDMI DDC pins 15/16 or HDMI
+> +5 V pin 18 directly to the Pico. Any later DDC experiment must use suitable
+> bidirectional level shifting. Pin 18, if a particular TV needs it for HDMI
+> presence detection, must use a separately reviewed protected interface.
 
-## Cloning
-To avoid cloning unneeded code, clone like this:
-```
-git -c submodule.active="lib/tinyusb" -c submodule.active=":(exclude,glob){lib,hw}/*" clone --recurse-submodules
-```
+## Baseline
 
-Alternatively, clone everything in pico-sdk and tinyUSB:
-```
-git clone --recurse-submodules
-```
+The firmware starts from [gkoh/pico-cec](https://github.com/gkoh/pico-cec),
+which provides an RP2040-native, interrupt-driven CEC implementation, USB CDC
+command interface, logical-address allocation, and persistent configuration.
+The first target is the original Raspberry Pi Pico, with a manually configured
+physical address and no DDC connection.
 
-## Building
-This project uses the 'normal' CMake based build.  
-The build depends on cmake (obviously), gcc-arm-none-eabi, and libnewlib-dev.
+Samsung/Anynet+ behavior will be validated using this sequence:
 
-Two boards are supported, and the RP2040 and RP2350 produce incompatible
-`.uf2` images, so build for the board you actually have:
-```
-$ git clone <blah blah as above>
-$ cd pico-cec
-```
+1. claim a Playback Device logical address;
+2. advertise the PC video port with `Report Physical Address`;
+3. send `Image View On` to the TV;
+4. wait for the TV to wake;
+5. broadcast `Active Source` for the PC video port.
 
-For the Seeed XIAO RP2350 (current reference hardware):
-```
-$ cmake -S . -B build -DPICO_BOARD=seeed_xiao_rp2350 && cmake --build build
-```
+Power-off uses the directed `Standby` command. Exact delays and retries will
+be tuned on the target TV rather than assumed from its unknown model number.
 
-For the Seeed XIAO RP2040 (legacy):
-```
-$ cmake -S . -B build -DPICO_BOARD=seeed_xiao_rp2040 && cmake --build build
-```
+See [docs/PLAN.md](docs/PLAN.md) for the staged implementation and acceptance
+gates, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the protocol and
+host integration design.
 
-Switching boards requires a clean build directory (`rm -rf build`).
+## Project state
 
-### Customising the Build
-The CMake project supports three options:
-* PICO_BOARD: specify variant of Pico board, defaults to Seeed XIAO RP2350 (potential values [here](https://github.com/raspberrypi/pico-sdk/tree/master/src/boards/include/boards))
-* CEC_PIN: specify GPIO pin for HDMI CEC, defaults to GPIO3
-* CEC_OSD_NAME: specify the OSD string for HDMI input Pico-CEC is controlling, defaults to "Pico-CEC"
-Example invocation to specify:
-* use Raspberry Pi Pico development board
-* use GPIO pin 11
-* use OSD_NAME "Bazzite"
+The project is in the baseline firmware phase. Nothing should be connected to
+the TV until the wiring is continuity-checked and the firmware image has been
+built and inspected.
 
-```
-$ cmake -DPICO_BOARD=pico -DCEC_PIN=11 -DCEC_OSD_NAME="Bazzite" ..
-$ make
-```
+## Upstream and license
 
-## Installing
-Assuming a successful build, the build directory will contain `pico-cec.uf2`,
-this can be written to the Pico as per normal:
-* connect the Pico to computer via USB cable
-* reset the Pico by holding 'Boot' and pressing 'Reset'
-   * Pico now presents as a USB mass storage device
-* copy `pico-cec.uf2` to the Pico
-* disconnect
-
-A command line interface over serial port is available, the guide can be found
-here: [Command Line Interface Guide](https://github.com/gkoh/pico-cec/wiki/Command-Line-Interface-Guide)
-
-## Blinking Lights
-The RGB LED provides basic functional diagnosis:
-* blue 2Hz: idle, CEC standby
-* green 2Hz: CEC active
-* green flash: CEC user button pressed
-* red: crash
-
-If there are no lights, something is very wrong.
-If this occurs, please consider raising an issue.
-
-# Real World Usage
-This is currently working with:
-* a Sharp 60" TV (physical address 0x1000)
-   * directly connected to TV HDMI input 1
-* through a Denon AVR connected to the Sharp TV (physical address 0x1100)
-   * Pico-CEC connected to Denon AVR HDMI input 1
-   * Denon AVR connected to TV HDMI input 1
-* a Sony 60" TV (physical address 0x1000)
-   * directly connected to TV HDMI input 1
-
-# Design
-## Hardware
-The hardware connections are extremely simple. Both HDMI CEC and the Pico are
-3.3V obviating the need for level shifters. The DDC bus (for EDID) is I2C and
-5V, however, the Pico appears to be 5V tolerant.
-
-Additionally, we rely on the GPIO input/output impedance states to read or drive
-the CEC bus. DDC is I2C requiring data and clock lines.
-Thus, we need to directly connect four wires:
-* HDMI CEC pin 13 direct to a GPIO
-* HDMI CEC ground pin 17 direct to GND
-* HDMI DDC clock pin 15 direct to SCL
-* HDMI DDC data pin 16 direct to SDA
-* Optional if safe:
-   * HDMI +5V power pin direct to 5V
-
-For the Seeed Studio XIAO RP2350:
-* HDMI pin 13 --> D10
-* HDMI pin 17 --> GND
-* HDMI pin 15 --> D5
-* HDMI pin 16 --> D4
-* HDMI pin 18 --> 5V/VUSB
-
-### Schematic
-![Basic schematic.](https://github.com/user-attachments/assets/61a759ca-198a-4f6b-a60f-0255d08b8441)
-
-After this we:
-* connect `Pico-CEC` to the HDMI output of the PC
-* connect the HDMI cable from the TV to `Pico-CEC`
-* connect a USB cable from `Pico-CEC` to the PC
-
-### Prototype
-
-![Initial prototype.](https://github.com/user-attachments/assets/88f2631f-e33f-4994-91dc-cc9e3c07016a)
-
-### Enclosure
-The enclosure is a reasonably simple three piece sandwich 3d print modelled with OpenSCAD. It is designed to be printed as three separate pieces which are bolted together with M3 nuts and bolts.
-An exploded preview of the result can be found in this [STL](openscad/pico-cec.stl).
-
-
-### Assembly
-![XIAO RP2040 with HDMI pass through and DDC.](https://github.com/user-attachments/assets/01c244b4-b5af-4926-94d2-38306876485b)
-
-![Partially assembled Pico-CEC.](https://github.com/user-attachments/assets/c37bb127-409a-4ed1-acc1-4e83cf8a6d58)
-
-## Software
-The software is extremely simple and built on FreeRTOS tasks:
-* cec_task
-   * interact with HDMI CEC sending user control message inputs to a queue
-* hid_task
-   * read the user control messages from the queue and send to the USB task
-* usbd_task
-   * generate an HID keyboard input for the USB host
-* blink_task
-   * heart beat, no blink == no work
-
-## cec_task
-The CEC task comprises three major components:
-* `cec_frame_recv`
-   * receives and validates CEC packets from the CEC GPIO pin
-   * edge interrupt driven state machine
-      * rewritten from busy wait loop to reduce CPU load
-* `cec_frame_send`
-   * formats and sends CEC packets on the CEC GPIO pin
-   * alarm interrupt driven state machine
-      * rewritten from busy wait loop to reduce CPU load
-* main control loop
-   * manages CEC send and receive
-
-All the HDMI frame handling was rewritten to be hardware/timer interrupt driven
-to meet real-time constraints.
-Attempts to increase the FreeRTOS tick timer along with busy wait loops were
-simply unable to consistently meet the CEC timing windows.
-
-## hid_task and usbd_task
-
-These are simple FreeRTOS tasks effectively taken straight from the TinyUSB
-examples.
-
-## Dependencies
-This project uses:
-* [crc](https://github.com/gityf/crc)
-* [FreeRTOS-Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel)
-* [pico-sdk](https://github.com/raspberrypi/pico-sdk)
-   * [tinyusb](https://github.com/hathach/tinyusb)
-* [tcli](https://github.com/dpse/tcli)
-
-# Hardware
-* Seeed Studio XIAO RP2350 (chosen for form factor)
-   * https://www.seeedstudio.com/Seeed-XIAO-RP2350-p-5944.html
-   * Originally prototyped on the Raspberry Pi Pico board (still works but
-     requires RGB unhacking)
-* HDMI male/female passthrough adapter
-   * Listed as 'HDMI Male and Female Test Board MINI Connector with Board PCB
-     2.54mm pitch 19/20pin DP HD A Female To Male Adapter Board'
-   * Model number: WP-905
-   * https://www.aliexpress.com/item/1005004791079117.html
-* custom 3d printed housing
-
-# Bill of Materials
-| Component | Quantity | Price (January 2026) (AUD) |
-| :--- | ---: | ---: |
-| Seeed Studio XIAO RP2350 | 1 | 10.60 |
-| HDMI male/female adapter | 1 | 4.30 |
-| M3x10mm bolt & nut | 2 | 0.16 |
-| M3x20mm bolt & nut | 2 | 0.17 |
-| Random short wires | 4 | basically free |
-| Scunge 3D print from friend | 1 | mostly free |
-| Umpteen hours of engineering | 1 | priceless |
-| Total | | 15.23 |
-
-# cec-compliance
-As of v0.2.2, `pico-cec` now passes the cec-compliance test suite found in the
-Linux `v4l-utils` package.
-More details can be found in the wiki entry:
-https://github.com/gkoh/pico-cec/wiki/CEC-Compliance-Testing
-
-Furthermore, `pico-cec` has been able to survive one hour of cec-compliance fuzz
-testing.
-
-# Debugging
-A command line terminal over serial port is supported.
-Details can be found in the wiki entry:
-https://github.com/gkoh/pico-cec/wiki/Command-Line-Interface-Guide
-
-In particular, `debug on` will log all CEC traffic to the terminal.
-
-# Future
-* implement CEC send and receive in PIO
-* port to ESP32?
-   * WS2812 driver will need platform support, perhaps to RMT
-   * implement CEC in RMT
-
-# References
-Inspiration and/or ground work was obtained from the following:
-* https://github.com/SzymonSlupik/CEC-Tiny-Pro
-* https://github.com/tsowell/avr-hdmi-cec-volume
+This repository is derived from `gkoh/pico-cec` and retains its Git history.
+Its MIT license and original copyright notice are in [LICENSE](LICENSE).
+The `upstream` Git remote tracks the original project.
