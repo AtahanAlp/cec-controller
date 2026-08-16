@@ -10,7 +10,11 @@
  * Number of milliseconds to delay the EDID probe. The DDC bus is shared and a
  * delay can avoid access conflicts.
  */
+#if CEC_ENABLE_DDC
 static const uint32_t default_edid_delay_ms = 5000;
+#else
+static const uint32_t default_edid_delay_ms = 0;
+#endif
 
 /**
  * Default physical address.

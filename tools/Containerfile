@@ -1,0 +1,14 @@
+FROM docker.io/library/fedora:42
+
+RUN dnf install -y \
+        arm-none-eabi-binutils-cs \
+        arm-none-eabi-gcc-cs \
+        arm-none-eabi-gcc-cs-c++ \
+        arm-none-eabi-newlib \
+        cmake \
+        gcc-c++ \
+        git \
+        ninja-build \
+    && dnf clean all
+
+WORKDIR /src

@@ -61,14 +61,15 @@ Power-off uses the directed `Standby` command. Exact delays and retries will
 be tuned on the target TV rather than assumed from its unknown model number.
 
 See [docs/PLAN.md](docs/PLAN.md) for the staged implementation and acceptance
-gates, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the protocol and
-host integration design.
+gates, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the protocol and host
+integration design, and [docs/BUILD.md](docs/BUILD.md) for the reproducible
+firmware build and baseline smoke test.
 
 ## Project state
 
-The project is in the baseline firmware phase. Nothing should be connected to
+The safe original-Pico baseline is buildable. Nothing should be connected to
 the TV until the wiring is continuity-checked and the firmware image has been
-built and inspected.
+flashed and inspected over USB.
 
 ## Upstream and license
 
