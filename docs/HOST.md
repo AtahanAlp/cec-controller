@@ -1,131 +1,80 @@
-# Bazzite host integration
+# Linux integration
 
-`cecctl` is a small C executable linked only to glibc. It has no background
-mode. Two systemd oneshot services invoke it at lifecycle boundaries, so no
-client process, private memory, or client CPU use remains at steady state.
+`cecctl` is a small C program with no daemon mode. systemd runs it only when
+the PC boots, shuts down, suspends, or resumes.
 
-## Build and test
+## Support
 
-From the repository root:
+Automatic setup requires Linux with systemd, udev, and DRM connector data in
+`/sys/class/drm`. This covers Bazzite and most Fedora, Ubuntu, Debian, and
+Arch-based desktops. Other init systems can call `cecctl` from equivalent
+hooks.
 
-```sh
-./tools/build-host
-```
-
-The Podman build compiles with warnings as errors, runs EDID and reply-parser
-tests, exercises a complete command exchange through a pseudo-terminal, and
-checks both unit files with `systemd-analyze verify`. The resulting executable
-is `build/host/cecctl`.
-
-The client is intentionally dependency-free beyond glibc. Bazzite recommends
-avoiding `rpm-ostree` layering when a standalone command will work. On the
-rpm-ostree layout, `/usr/local` is machine-local state backed by `/var`, so the
-installer can use the conventional `/usr/local/bin` location without altering
-the OS image.
-
-## Address discovery
-
-For `on`, the client selects the address in this order:
-
-1. `physical_address=` from `/etc/cec-controller.conf`;
-2. the HDMI VSDB in the EDID of `connector=`, if configured;
-3. the only connected `HDMI-A` connector with a valid CEC address;
-4. the last valid address cached in
-   `/var/lib/cec-controller/physical-address`.
-
-The cache matters on real TVs: hot-plug detect can fall and make EDID vanish
-while the display is in standby. The first discovery should therefore be done
-with the TV awake. If more than one connected HDMI connector contains a CEC
-address, auto-detection fails safely and asks for a connector name.
-
-Examples:
-
-```sh
-build/host/cecctl --config /nonexistent --sysfs-root /sys/class/drm detect
-build/host/cecctl --config /nonexistent --physical-address 1.0.0.0 detect
-```
-
-After installation, omit the executable path and config override:
-
-```sh
-cecctl detect
-cecctl protocol
-cecctl on
-cecctl status
-cecctl standby
-```
-
-`on` sends the discovered address and activation request as one versioned USB
-command. All device opens and replies have finite deadlines. Exit code `0`
-means success, `2` is command-line misuse, `3` is address/configuration
-failure, `4` is USB transport failure, and `5` is a controller-reported CEC
-failure.
-
-## Install on Bazzite
-
-Build first, then install from the checkout:
+## Build and manually test
 
 ```sh
 ./tools/build-host
+
+device=/dev/serial/by-id/usb-Couch_CEC_Couch_CEC_Controller_*-if00
+build/host/cecctl --config /nonexistent --device $device protocol
+build/host/cecctl --config /nonexistent --device $device detect
+build/host/cecctl --config /nonexistent --device $device status
+build/host/cecctl --config /nonexistent --device $device standby
+build/host/cecctl --config /nonexistent --device $device on
+```
+
+Run these with the TV awake and exactly one Pico attached. `detect` reads the
+CEC physical address from the EDID of the GPU's HDMI connection. The last good
+address is cached because some TVs hide EDID while sleeping.
+
+## Install
+
+Only after manual standby and wake work:
+
+```sh
 sudo ./tools/install-host
 ```
 
-The installer places exactly these managed files:
+The installer adds:
 
 - `/usr/local/bin/cecctl`;
-- `/etc/udev/rules.d/70-cec-controller.rules`;
-- `/etc/systemd/system/cec-controller-boot.service`;
-- `/etc/systemd/system/cec-controller-sleep.service`;
-- `/etc/cec-controller.conf`, only when it does not already exist;
-- `/var/lib/cec-controller/`, for the last-known physical address.
+- `/etc/cec-controller.conf`;
+- one udev rule creating `/dev/cec-controller`;
+- two systemd oneshot units;
+- `/var/lib/cec-controller/physical-address` when an address is cached.
 
-It enables but does not start the services. This prevents installation from
-transmitting CEC before the cable has passed the Phase 4 continuity checks.
-After hardware bring-up:
+It enables but does not start automatic control. Reconnect the Pico, then run:
 
 ```sh
 cecctl detect
-cecctl on
+cecctl status
 sudo systemctl start cec-controller-boot.service
 ```
 
-The boot service runs `on` once and remains active without a process; normal
-systemd shutdown stops it and invokes `standby`. The sleep service is tied to
-`sleep.target`: `ExecStart` runs `standby` before suspend/hibernate, and
-`ExecStop` runs `on` after resume. Leading `-` markers in the unit commands
-make CEC failure visible in the journal without blocking a PC power
-transition.
+## Configuration
 
-Useful diagnostics:
+Usually auto-detection is enough. If several HDMI displays are active, edit
+`/etc/cec-controller.conf`:
+
+```ini
+connector=card1-HDMI-A-1
+```
+
+If EDID has no CEC address, set the PC's TV input directly:
+
+```ini
+physical_address=3.0.0.0
+```
+
+Use the input carrying video, not the spare CEC-only input.
+
+## Check or remove
 
 ```sh
 systemctl status cec-controller-boot.service cec-controller-sleep.service
-journalctl -u cec-controller-boot.service -u cec-controller-sleep.service
-```
-
-Uninstall program integration while retaining the user-edited configuration
-and cached address:
-
-```sh
+journalctl -b -u cec-controller-boot.service -u cec-controller-sleep.service
 sudo ./tools/install-host --uninstall
 ```
 
-## Design references
-
-- [Linux CEC physical-address documentation](https://docs.kernel.org/userspace-api/media/cec/cec-ioc-adap-g-phys-addr.html)
-  defines the `a.b.c.d` hierarchy and confirms that a source reads its address
-  from the sink EDID.
-- [Linux HDMI-CEC administration guide](https://docs.kernel.org/admin-guide/media/cec.html)
-  demonstrates obtaining an address from a DRM connector's `edid` sysfs
-  attribute.
-- [Linux CEC transmit documentation](https://docs.kernel.org/userspace-api/media/cec/cec-ioc-receive.html)
-  records the important standby case where HPD falls and the EDID disappears.
-- [systemd.special](https://man7.org/linux/man-pages/man7/systemd.special.7.html)
-  specifies the combined `sleep.target` oneshot pattern used here, including
-  `RemainAfterExit`, `StopWhenUnneeded`, `ExecStart`, and `ExecStop`.
-- [Bazzite software guidance](https://docs.bazzite.gg/Installing_and_Managing_Software/software-intro/)
-  recommends standalone approaches over system package layering where
-  possible.
-- [rpm-ostree treefile reference](https://coreos.github.io/rpm-ostree/treefile/)
-  documents the default `/usr/local` mapping to persistent machine-local
-  `/var` storage.
+Uninstall retains the configuration and cached address so a later reinstall
+does not discard user choices.

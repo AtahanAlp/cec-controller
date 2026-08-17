@@ -99,8 +99,8 @@ The existing shell command updates the running physical address immediately:
 set config physical_address 1000
 ```
 
-`save` persists the current configuration. The automatic Bazzite integration
-will normally derive the real GPU input address and set it at runtime, while a
+`save` persists the current configuration. The automatic Linux integration
+normally derives the real GPU input address and sets it at runtime, while a
 saved value remains useful for manual bring-up.
 
 The compact NVS configuration format is version 4. Older upstream keymap-based

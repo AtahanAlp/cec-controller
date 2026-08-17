@@ -1,123 +1,131 @@
-# Firmware build and baseline smoke test
+# Building the firmware and host client
 
-## Prerequisites
+## Clone dependencies
 
-The build uses Podman, which is already part of the intended Bazzite workflow.
-The compiler and SDK tooling stay inside a Fedora container; no packages need
-to be layered onto the host OS.
-
-Clone the pinned dependencies once after cloning the repository:
+The Pico SDK, FreeRTOS kernel, and command parser are pinned as Git submodules:
 
 ```sh
-git submodule update --init --recursive FreeRTOS-Kernel pico-sdk tcli
+git clone --recurse-submodules https://github.com/AtahanAlp/cec-controller.git
+cd cec-controller
 ```
 
-The recursive command currently fetches some dependency test and wireless
-submodules that this firmware does not compile. Their revisions are still
-pinned by the parent projects, and nothing is installed outside the checkout
-or Podman's normal image storage.
-
-## Build
-
-Run:
+For an existing clone:
 
 ```sh
-./tools/build-firmware
+git submodule update --init --recursive
 ```
 
-The script builds a reusable local image named
-`localhost/cec-controller-builder:fedora42`, then writes the firmware to:
+## Reproducible container build
 
-```text
-build/firmware/pico-cec.uf2
-```
+The supplied tools automatically prefer Podman and fall back to Docker. The
+compiler and Pico SDK tooling stay inside a Fedora builder image; nothing is
+installed on the host.
 
-The configured baseline is:
-
-| Setting | Value |
-| --- | --- |
-| Board | original Raspberry Pi Pico / RP2040 |
-| CEC GPIO | GP11, physical Pico pin 15 |
-| USB | CDC controller with chip-unique serial number |
-| Device type | Playback Device |
-| Logical address | automatic, preferring 4 then 8 then 11 |
-| Physical address | manual, initially unset (`0.0.0.0`) |
-| DDC | compiled out |
-| Status LED | Pico's onboard LED; WS2812 output compiled out |
-
-The CEC HDMI pin 13 wire goes to Pico GP11. HDMI pin 17 goes to any Pico GND,
-for example physical pin 18 next to GP11. Do not connect the hardware while
-continuity testing the cut cable.
-
-To remove the reusable builder image later:
-
-```sh
-podman image rm localhost/cec-controller-builder:fedora42
-```
-
-## Flash
-
-1. Disconnect the Pico from the TV-side cable.
-2. Hold `BOOTSEL` while connecting the Pico to the PC over USB.
-3. Copy `build/firmware/pico-cec.uf2` onto the `RPI-RP2` USB drive.
-4. Wait for the drive to disappear and the Pico to enumerate again.
-
-## Configure the physical address
-
-Connect a serial terminal at 115200 baud to the stable device symlink under
-`/dev/serial/by-id/`. Use the physical address of the TV input carrying the
-PC's real video signal. For HDMI input 1, the value is usually `1000`; confirm
-it rather than relying on the example.
-
-Enter these commands one line at a time:
-
-```text
-show version
-show config
-set config physical_address 1000
-save
-tv protocol
-```
-
-The physical address takes effect immediately. `save` is optional for the later
-automatic host workflow, but useful during manual bring-up. Confirm that the
-running configuration is no longer `0.0.0.0`:
-
-```text
-show cec
-show nvs
-```
-
-## First CEC smoke test
-
-Only after the cut cable has passed continuity and short-circuit checks,
-connect it to the TV's spare HDMI input. With an allocated Playback Device
-logical address, the purpose-built command runs the Samsung sequence:
-
-```text
-tv on
-tv status
-```
-
-To request standby:
-
-```text
-tv standby
-show stats cec
-```
-
-An incrementing `CEC tx noack` count is useful evidence, not a reason to add
-more HDMI wires blindly. Record it alongside the TV behavior before moving to
-a fallback.
-
-The raw `send` command remains available for individual-frame diagnosis. The
-normal reply format and error codes are documented in
-[PROTOCOL.md](PROTOCOL.md).
-
-## Tests
-
-Run the native sequence tests independently of the firmware build:
+Build and test everything:
 
 ```sh
 ./tools/test-firmware
+./tools/build-firmware
+./tools/build-host
+```
+
+Outputs are written only under `build/`:
+
+```text
+build/firmware/pico-cec.uf2
+build/host/cecctl
+```
+
+Set `CEC_CONTAINER_ENGINE=docker` or `CEC_CONTAINER_ENGINE=podman` to choose
+explicitly.
+
+## Firmware settings
+
+The supported default is:
+
+| Setting | Default |
+| --- | --- |
+| Board | original Raspberry Pi Pico / RP2040 |
+| CEC GPIO | GP11, Pico physical pin 15 |
+| OSD name | `Couch PC` |
+| Device type | Playback Device |
+| Logical address | automatic, preferring 4, 8, then 11 |
+| Physical address | supplied at runtime by the host |
+| DDC | disabled |
+| Status LED | Pico onboard LED |
+
+Override safe build settings through the environment:
+
+```sh
+CEC_GPIO=7 \
+CEC_OSD_NAME="Living Room PC" \
+CEC_BOARD=pico \
+./tools/build-firmware
+```
+
+The script rejects invalid GPIO numbers and OSD names longer than 14
+characters. Other Pico SDK board definitions may compile, but only the
+original Pico is currently hardware-validated.
+
+## Flash the Pico
+
+1. Disconnect the CEC-only HDMI cable from the TV.
+2. Hold `BOOTSEL` while connecting the Pico to the PC over USB.
+3. Copy `build/firmware/pico-cec.uf2` to the `RPI-RP2` drive.
+4. Wait for the drive to disappear and the USB serial device to enumerate.
+
+The runtime USB identity is `cafe:4001`. Linux should create a stable path
+similar to:
+
+```text
+/dev/serial/by-id/usb-Couch_CEC_Couch_CEC_Controller_<serial>-if00
+```
+
+## Firmware smoke test
+
+Open the stable serial path at 115200 baud and run:
+
+```text
+show version
+show cec
+tv protocol
+```
+
+Expected protocol reply:
+
+```text
+CECCTRL/1 OK command=protocol firmware=<git-version>
+```
+
+After completing the continuity checks in [HARDWARE.md](HARDWARE.md), connect
+the TV and test `tv status` before any power-changing command.
+
+## Native host build
+
+The Linux client requires a C11 compiler, CMake 3.20 or newer, and a build
+tool. A native build does not require the ARM toolchain or Pico SDK:
+
+```sh
+cmake -S host -B build/host-native -DCMAKE_BUILD_TYPE=Release
+cmake --build build/host-native
+ctest --test-dir build/host-native --output-on-failure
+```
+
+The resulting `build/host-native/cecctl` links only against the system C
+library. The container-built client uses glibc.
+
+## Cleaning build output
+
+All generated project files are contained under `build/`, which is ignored by
+Git. Remove that directory when a completely clean rebuild is desired. The
+reusable container image is named:
+
+```text
+localhost/cec-controller-builder:fedora42
+```
+
+Remove it with the same engine used to build, for example:
+
+```sh
+podman image rm localhost/cec-controller-builder:fedora42
 ```

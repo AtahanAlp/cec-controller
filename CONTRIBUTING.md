@@ -1,19 +1,61 @@
 # Contributing
 
-Contributions to the `pico-cec` project are welcome.
+Contributions, TV compatibility reports, documentation fixes, and host clients
+for additional operating systems are welcome.
 
-## Use of LLMs
+## Before opening a change
 
-`pico-cec` is carefully and purposefully crafted and will remain so for the
-forseeable future.
-All tools must be wielded responsibly and precisely, large language models are
-no exception.
+- Keep the default hardware path limited to CEC pin 13 and ground pin 17.
+- Do not add direct RP2040 connections to HDMI +5 V or DDC.
+- Keep every USB and CEC operation bounded; TV failure must never block host
+  suspend or shutdown.
+- Preserve the no-daemon design unless a feature has a demonstrated need for a
+  resident process.
+- Separate verified behavior from expected compatibility.
 
-To ensure provenance and traceability, please ensure:
-- you review all changes
-- you understand the origin of the changes
-- you take full responsibility for the changes
-- you disclose use of an LLM in the commit log, eg:
-   - `Assisted-by: <tool>:<model>`
+For a substantial new feature, open an issue first so protocol and hardware
+implications can be discussed before implementation.
 
-All contributions will continue to pass through human review before acceptance.
+## Development setup
+
+Clone all submodules and run the reproducible checks:
+
+```sh
+git clone --recurse-submodules https://github.com/AtahanAlp/cec-controller.git
+cd cec-controller
+./tools/test-firmware
+./tools/build-host
+./tools/build-firmware
+```
+
+Use `clang-format` with the repository's `.clang-format` file for C/C++
+changes. Do not reformat imported code under `crc/` or Git submodules.
+
+## Pull requests
+
+- Keep commits focused and use concise imperative subjects.
+- Add or update tests for behavior changes.
+- Update user documentation when commands, wiring, or installation changes.
+- State which TV, MCU, host OS, and topology were tested.
+- Never include USB serial numbers, private logs, or unrelated generated files.
+
+## Compatibility reports
+
+A useful report includes:
+
+- TV manufacturer and model;
+- RP2040 board and selected GPIO;
+- host OS and version;
+- CEC-only and video HDMI input numbers;
+- output from `cecctl protocol`, `cecctl detect`, and `cecctl status`;
+- whether standby, wake, and input selection each worked;
+- `show stats cec` output when a command failed.
+
+If the exact TV model is unavailable, say so and include the CEC trade name
+(Anynet+, Bravia Sync, Simplink, and so on).
+
+## Licensing
+
+By contributing, you agree that your contribution is distributed under the
+project's MIT license. Retain copyright and license notices in imported or
+derived files.

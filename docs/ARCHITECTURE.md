@@ -69,9 +69,9 @@ should produce a concise journal entry and a useful client exit status.
 
 ## USB interface direction
 
-Phase 1 retains the upstream CDC shell so the electrical setup can be tested
-with raw frames. Phase 2 replaces general shell parsing in normal operation
-with a deliberately small, versioned command set. Commands must be idempotent
+The firmware retains the upstream CDC shell so the electrical setup can be
+tested with raw frames. Normal operation uses a deliberately small, versioned
+command set. Commands must be idempotent
 where possible, newline framed for easy diagnosis, and bounded by host and
 device timeouts.
 
@@ -84,6 +84,6 @@ firmware manufacturer/product strings all match. `cecctl` probes `CECCTRL/1`
 before issuing any control operation, so a wrong or incompatible serial device
 cannot be treated as this controller.
 
-The host caches only the last valid physical address. This is necessary because
+The Linux host caches only the last valid physical address. This is necessary because
 some TVs remove hot-plug detect and EDID in standby. It does not cache TV power
 state or run a reconciler; lifecycle events remain the sole policy inputs.

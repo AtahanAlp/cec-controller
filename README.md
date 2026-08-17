@@ -1,84 +1,123 @@
 # Couch CEC Controller
 
-An RP2040-based HDMI-CEC bridge that makes a Samsung TV behave like the
-monitor of a Bazzite couch PC. The PC sends small commands over USB; a
-Raspberry Pi Pico transmits the corresponding CEC messages to the TV.
+[![CI](https://github.com/AtahanAlp/cec-controller/actions/workflows/main.yml/badge.svg)](https://github.com/AtahanAlp/cec-controller/actions/workflows/main.yml)
 
-The primary behavior is deliberately narrow:
+Make a TV behave like a PC monitor: wake it, select the PC input, and put it in
+standby automatically. A Raspberry Pi Pico handles HDMI-CEC and a tiny Linux
+client runs only at boot, shutdown, suspend, and resume—there is no daemon.
 
-- wake the TV and select the PC's HDMI input when the PC boots or resumes;
-- put the TV in standby before the PC suspends or shuts down;
-- require no continuously running host daemon.
+## What you need
 
-Volume and other remote-replacement controls can be added after the power and
-input-selection path is reliable.
+- original Raspberry Pi Pico (RP2040);
+- spare HDMI cable to cut for CEC;
+- USB data cable;
+- normal HDMI connection from the PC to the TV;
+- Podman or Docker for the reproducible build.
 
-## Initial topology
+The tested setup is an older Samsung Anynet+ TV, but it uses standard HDMI-CEC
+commands and should work with many CEC-enabled TVs.
 
-The first prototype uses two independent TV HDMI inputs:
+## 1. Wire the Pico
 
-```text
-PC GPU ---------------- normal HDMI cable ----------------> TV video input
-   |
-   +-- USB --> Raspberry Pi Pico --> CEC-only HDMI cable --> TV spare input
+Only two HDMI wires are used:
+
+| HDMI Type A pin | Signal | Raspberry Pi Pico |
+| --- | --- | --- |
+| 13 | CEC | GP11, physical pin 15 |
+| 17 | DDC/CEC ground | GND, physical pin 18 |
+
+Plug and receptacle views are mirrored. Read the short
+[wiring guide](docs/HARDWARE.md) and verify both wires with a continuity meter
+before connecting the TV. Do not connect HDMI +5 V or DDC to the Pico.
+
+## 2. Build and flash
+
+```sh
+git clone --recurse-submodules https://github.com/AtahanAlp/cec-controller.git
+cd cec-controller
+./tools/build-firmware
+./tools/build-host
 ```
 
-Only these conductors are required in the CEC-only cable:
+Hold the Pico's `BOOTSEL` button while plugging in USB, then copy:
 
-| HDMI pin | Signal | Pico connection |
-| --- | --- | --- |
-| 13 | CEC | Configured 3.3 V GPIO |
-| 17 | DDC/CEC ground | GND |
+```text
+build/firmware/pico-cec.uf2
+```
 
-DDC pins 15 and 16 are intentionally disconnected in the first prototype.
-The host can obtain the physical address of the real video connection from
-the GPU connector's EDID and pass it to the Pico over USB. Reading EDID on the
-spare CEC-only input would identify the wrong HDMI port.
+to the `RPI-RP2` drive.
 
-> [!CAUTION]
-> RP2040 GPIO is not 5 V tolerant. Do not connect HDMI DDC pins 15/16 or HDMI
-> +5 V pin 18 directly to the Pico. Any later DDC experiment must use suitable
-> bidirectional level shifting. Pin 18, if a particular TV needs it for HDMI
-> presence detection, must use a separately reviewed protected interface.
+## 3. Test before installing
 
-## Baseline
+Turn on HDMI-CEC in the TV settings. With exactly one controller attached:
 
-The firmware starts from [gkoh/pico-cec](https://github.com/gkoh/pico-cec),
-which provides an RP2040-native, interrupt-driven CEC implementation, USB CDC
-command interface, logical-address allocation, and persistent configuration.
-The first target is the original Raspberry Pi Pico, with a manually configured
-physical address and no DDC connection.
+```sh
+device=/dev/serial/by-id/usb-Couch_CEC_Couch_CEC_Controller_*-if00
 
-Samsung/Anynet+ behavior will be validated using this sequence:
+build/host/cecctl --config /nonexistent --device $device protocol
+build/host/cecctl --config /nonexistent --device $device detect
+build/host/cecctl --config /nonexistent --device $device status
+build/host/cecctl --config /nonexistent --device $device standby
+build/host/cecctl --config /nonexistent --device $device on
+```
 
-1. claim a Playback Device logical address;
-2. advertise the PC video port with `Report Physical Address`;
-3. send `Image View On` to the TV;
-4. wait for the TV to wake;
-5. broadcast `Active Source` for the PC video port.
+If `detect` cannot identify the video input, add its CEC physical address to
+the command, for example `--physical-address 3.0.0.0` for TV HDMI 3.
 
-Power-off uses the directed `Standby` command. Exact delays and retries will
-be tuned on the target TV rather than assumed from its unknown model number.
+## 4. Enable automatic control on Linux
 
-See [docs/PLAN.md](docs/PLAN.md) for the staged implementation and acceptance
-gates, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the protocol and host
-integration design, [docs/BUILD.md](docs/BUILD.md) for the reproducible
-firmware build and baseline smoke test, and [docs/PROTOCOL.md](docs/PROTOCOL.md)
-for the versioned USB commands. [docs/HOST.md](docs/HOST.md) covers the tiny
-Bazzite client, EDID discovery, installation, systemd lifecycle, and the
-primary technical references.
+After both manual power commands work:
 
-## Project state
+```sh
+sudo ./tools/install-host
+cecctl detect
+cecctl status
+sudo systemctl start cec-controller-boot.service
+```
 
-The purpose-built original-Pico firmware, `CECCTRL/1` USB protocol, and
-no-daemon Bazzite host client are buildable. Native sequence, EDID, protocol,
-and pseudo-terminal integration tests pass, and both systemd units verify. TV
-behavior is not yet validated. Nothing should be connected to the TV until the
-wiring is continuity-checked and the firmware image has been flashed and
-inspected over USB.
+That enables:
 
-## Upstream and license
+- PC boot/resume → wake TV and select the PC input;
+- PC suspend/shutdown → put TV in standby.
 
-This repository is derived from `gkoh/pico-cec` and retains its Git history.
-Its MIT license and original copyright notice are in [LICENSE](LICENSE).
-The `upstream` Git remote tracks the original project.
+The included automatic integration supports Linux with systemd and udev,
+including Bazzite, Fedora, Ubuntu, Debian, and Arch-based systems. Other
+operating systems can implement the small documented
+[USB protocol](docs/PROTOCOL.md).
+
+## Configuration
+
+Host settings live in `/etc/cec-controller.conf`. Most setups need no changes.
+Useful fallbacks are:
+
+```ini
+# Select one GPU output when several HDMI displays are connected.
+connector=card1-HDMI-A-1
+
+# Or set the PC video input directly.
+physical_address=3.0.0.0
+```
+
+To build for another Pico GPIO or change the TV's device name:
+
+```sh
+CEC_GPIO=7 CEC_OSD_NAME="Living Room PC" ./tools/build-firmware
+```
+
+Only the original Pico on GP11 has been hardware-tested so far.
+
+## Help and project status
+
+- [Wiring](docs/HARDWARE.md)
+- [Linux integration](docs/HOST.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Build details](docs/BUILD.md)
+
+Verified on the test TV: logical-address allocation, power query, standby,
+wake, and automatic switch to HDMI 3 using only CEC and ground. The next step
+is repeated lifecycle testing on the Bazzite couch PC. Compatibility reports
+and native clients for more operating systems are welcome.
+
+This project is derived from [gkoh/pico-cec](https://github.com/gkoh/pico-cec)
+and retains its original notices. It is available under the
+[MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) to help.
