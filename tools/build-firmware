@@ -3,27 +3,40 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$project_dir/tools/container-common"
+
 builder_image="localhost/cec-controller-builder:fedora42"
 build_dir="/src/build/firmware"
 version="$(git -C "$project_dir" describe --always --dirty)"
+cec_board="${CEC_BOARD:-pico}"
+cec_gpio="${CEC_GPIO:-11}"
+cec_osd_name="${CEC_OSD_NAME:-Couch PC}"
 
-podman build \
+if [[ ! $cec_gpio =~ ^[0-9]+$ ]] || ((cec_gpio > 29)); then
+  echo "CEC_GPIO must be an RP2040 GPIO number from 0 through 29." >&2
+  exit 2
+fi
+if ((${#cec_osd_name} == 0 || ${#cec_osd_name} > 14)) \
+  || [[ ! $cec_osd_name =~ ^[[:alnum:]._\ -]+$ ]]; then
+  echo "CEC_OSD_NAME must contain 1-14 letters, numbers, spaces, dots, dashes, or underscores." >&2
+  exit 2
+fi
+
+"$container_engine" build \
   --file "$project_dir/tools/Containerfile" \
   --tag "$builder_image" \
   "$project_dir/tools"
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   "$builder_image" \
   cmake -E remove_directory "$build_dir"
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   --workdir /src \
   "$builder_image" \
@@ -33,17 +46,16 @@ podman run --rm \
     -B "$build_dir" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DPICO_BOARD=pico \
-    -DCEC_PIN=11 \
-    -DCEC_OSD_NAME="Couch PC" \
+    -DPICO_BOARD="$cec_board" \
+    -DCEC_PIN="$cec_gpio" \
+    -DCEC_OSD_NAME="$cec_osd_name" \
     -DCEC_ENABLE_DDC=OFF \
     -DCEC_ENABLE_RGB_LED=OFF \
     -DPICO_CEC_VERSION="$version"
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   --workdir /src \
   "$builder_image" \

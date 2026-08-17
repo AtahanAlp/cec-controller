@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+if [[ -n ${CEC_CONTAINER_ENGINE:-} ]]; then
+  container_engine="$CEC_CONTAINER_ENGINE"
+elif command -v podman >/dev/null 2>&1; then
+  container_engine="podman"
+elif command -v docker >/dev/null 2>&1; then
+  container_engine="docker"
+else
+  echo "Install Podman or Docker, or set CEC_CONTAINER_ENGINE to its executable." >&2
+  exit 1
+fi
+
+if ! command -v "$container_engine" >/dev/null 2>&1; then
+  echo "Container engine not found: $container_engine" >&2
+  exit 1
+fi
+
+container_run_user=(--user "$(id -u):$(id -g)")
+if [[ $(basename -- "$container_engine") == "podman" ]]; then
+  container_run_user=(--userns=keep-id "${container_run_user[@]}")
+fi
+
+container_run_common=(--rm --security-opt label=disable)

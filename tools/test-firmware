@@ -3,36 +3,35 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$project_dir/tools/container-common"
+
 builder_image="localhost/cec-controller-builder:fedora42"
 build_dir="/src/build/tests/firmware"
 
-podman build \
+"$container_engine" build \
   --file "$project_dir/tools/Containerfile" \
   --tag "$builder_image" \
   "$project_dir/tools"
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   --workdir /src \
   "$builder_image" \
   cmake --fresh -S /src/tests/firmware -B "$build_dir" -G Ninja
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   --workdir /src \
   "$builder_image" \
   cmake --build "$build_dir"
 
-podman run --rm \
-  --security-opt label=disable \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
+"$container_engine" run \
+  "${container_run_common[@]}" \
+  "${container_run_user[@]}" \
   --volume "$project_dir:/src" \
   --workdir /src \
   "$builder_image" \
