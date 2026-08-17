@@ -1,135 +1,60 @@
-name: Pico-CEC Build
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
-env:
-  BUILD_TYPE: Release
-  RELEASE_ZIP: pico-cec-${{github.ref_name}}.zip
+permissions:
+  contents: read
 
 jobs:
-  format:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Run clang-format style check
-      uses: jidicula/clang-format-action@v4.11.0
-      with:
-        clang-format-version: '17'
-        check-path: .
-        exclude-regex: '(crc\/.+|FreeRTOS-Kernel\/.+|pico-sdk\/.+|tcli\/.+)'
-
   build:
-    needs: format
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        pico_board:
-          - seeed_xiao_rp2040
-          - seeed_xiao_rp2350
-          - waveshare_rp2040_zero
-          - vcc_gnd_yd_2040
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-
-    - name: Clone tinyusb
-      shell: bash
-      run: |
-        cd pico-sdk && git submodule update --init lib/tinyusb
-
-    - name: Install required packages
-      shell: bash
-      run: |
-        sudo apt update
-        sudo apt install --no-install-recommends -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
-
-    - name: Configure CMake
-      run: cmake -B ${{github.workspace}}/${{matrix.pico_board}} -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DPICO_CEC_VERSION=${{github.ref_name}} -DPICO_BOARD=${{matrix.pico_board}}
-
-    - name: Build Pico-CEC
-      run: cmake --build ${{github.workspace}}/${{matrix.pico_board}} --config ${{env.BUILD_TYPE}} --parallel
-
-    - name: Upload release artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: pico-cec-${{matrix.pico_board}}-${{ github.run_id }}
-        path: |
-          ${{github.workspace}}/${{matrix.pico_board}}/pico-cec.uf2
-        if-no-files-found: error
-
-  build-stl:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
-    - name: Install OpenSCAD
-      shell: bash
-      run: |
-        sudo apt update
-        sudo apt install --no-install-recommends -y openscad
+      - name: Test firmware logic
+        run: ./tools/test-firmware
 
-    - name: Export to STL
-      run: |
-        cd ${{github.workspace}}/openscad && make
+      - name: Build and test Linux client
+        run: ./tools/build-host
 
-    - name: Upload STL release artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: pico-cec-stl-${{ github.run_id }}
-        path: |
-          ${{github.workspace}}/openscad/*.stl
-        if-no-files-found: error
+      - name: Build RP2040 firmware
+        run: ./tools/build-firmware
 
-  success:
-    runs-on: ubuntu-latest
-    needs:
-      - build
-      - build-stl
-    steps:
-      - run: echo "Success!"
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: couch-cec-rp2040
+          path: build/firmware/pico-cec.uf2
+          if-no-files-found: error
 
   release:
-    needs: success
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
     runs-on: ubuntu-latest
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-
     permissions:
       contents: write
-
     steps:
-    - name: Download release artifacts
-      uses: actions/download-artifact@v4
-      with:
-        merge-multiple: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: couch-cec-rp2040
+          path: release
 
-    - name: Generate release hashes
-      run: |
-        ls -lR
-        mv pico-cec-seeed_xiao_rp2040-${{github.run_id}}/pico-cec.uf2 pico-cec-seeed_xiao_rp2040-${{github.ref_name}}.uf2
-        mv pico-cec-seeed_xiao_rp2350-${{github.run_id}}/pico-cec.uf2 pico-cec-seeed_xiao_rp2350-${{github.ref_name}}.uf2
-        mv pico-cec-stl-${{github.run_id}}/*.stl .
-        sha256sum pico-cec*.uf2 *.stl > sha256sum.txt
+      - name: Name and checksum firmware
+        run: |
+          mv release/pico-cec.uf2 release/couch-cec-rp2040-${{ github.ref_name }}.uf2
+          cd release
+          sha256sum *.uf2 > SHA256SUMS
 
-    - name: Compress release assets
-      run: |
-        zip ${{env.RELEASE_ZIP}} pico-cec*.uf2 *.stl sha256sum.txt
-
-    - name: Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          ${{env.RELEASE_ZIP}}
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            release/*.uf2
+            release/SHA256SUMS
