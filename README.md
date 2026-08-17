@@ -12,6 +12,8 @@ system resources all the time!).
 > planned where practical. TV behavior varies, so only the setups in the
 > compatibility table below should be considered verified.
 
+![Raspberry Pi Pico with its USB and CEC-only HDMI cables](docs/images/controller-overview.jpg)
+
 ## What you need
 
 - Raspberry Pi Pico (RP2040);

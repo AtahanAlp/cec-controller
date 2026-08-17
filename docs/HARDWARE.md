@@ -7,6 +7,10 @@ Use a normal HDMI cable for PC video and a second, cut cable for CEC only.
 | 13 | CEC | GP11, physical pin 15 |
 | 17 | DDC/CEC ground | GND, physical pin 18 |
 
+![HDMI plug wired to pins 13 and 17](images/hdmi-wiring-closeup.jpg)
+
+![Raspberry Pi Pico pinout showing GP11 on physical pin 15 and ground on physical pin 18](images/pico-pinout.png)
+
 Insulate every other cut conductor separately. Do not connect the HDMI shield
 as a substitute for pin 17.
 
