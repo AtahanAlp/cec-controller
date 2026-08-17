@@ -10,7 +10,8 @@
 TaskHandle_t xCECTask;
 
 #define CEC_BUS_IDLE_TIMEOUT_MS (1000)
-#define CEC_FRAME_TX_TIMEOUT_MS (100)
+/* A maximum-length 16-byte CEC frame takes just under 400 ms on the wire. */
+#define CEC_FRAME_TX_TIMEOUT_MS (500)
 
 static cec_message_t rx_message = {.data = {0x0}, .len = 0};
 static cec_frame_t rx_frame = {.message = &rx_message};
@@ -244,7 +245,7 @@ static int64_t frame_tx_callback(alarm_id_t alarm, void *user_data) {
       return time_next(frame->start, 2400);
     case CEC_FRAME_STATE_END:
     default:
-      xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_TX, 0, eNoAction, NULL);
+      xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_TX, 0, eIncrement, NULL);
       return 0;
   }
 }
@@ -257,6 +258,7 @@ static cec_tx_result_t frame_tx(const cec_message_t *message) {
   while (i < 7) {
     if ((xTaskGetTickCount() - idle_start) >= pdMS_TO_TICKS(CEC_BUS_IDLE_TIMEOUT_MS)) {
       cec_stats.tx_timeout_frames++;
+      cec_stats.tx_idle_timeout_frames++;
       return CEC_TX_TIMEOUT;
     }
     vTaskDelay(pdMS_TO_TICKS(3));
@@ -284,6 +286,7 @@ static cec_tx_result_t frame_tx(const cec_message_t *message) {
     }
     gpio_set_dir(CEC_PIN, GPIO_IN);
     cec_stats.tx_timeout_frames++;
+    cec_stats.tx_alarm_timeout_frames++;
     return CEC_TX_TIMEOUT;
   }
   // printf("high water mark = %lu\n", uxTaskGetStackHighWaterMark(xCECTask));

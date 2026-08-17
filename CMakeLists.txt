@@ -92,7 +92,8 @@ endif()
 add_executable(${PROJECT} ${PICO_CEC_SOURCES})
 
 target_compile_definitions(${PROJECT} PRIVATE
-  "CEC_ENABLE_DDC=$<BOOL:${CEC_ENABLE_DDC}>")
+  "CEC_ENABLE_DDC=$<BOOL:${CEC_ENABLE_DDC}>"
+  "CEC_PIN=${CEC_PIN}")
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
@@ -104,9 +105,6 @@ target_include_directories(${PROJECT} PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/include/tusb
   ${CMAKE_CURRENT_BINARY_DIR}/generated)
-
-set_source_files_properties(src/cec-frame.c PROPERTIES COMPILE_DEFINITIONS
-  "CEC_PIN=${CEC_PIN}")
 
 set_source_files_properties(src/usb-cdc.c PROPERTIES COMPILE_DEFINITIONS
   "PICO_CEC_VERSION=\"${PICO_CEC_VERSION}\"")

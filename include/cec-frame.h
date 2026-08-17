@@ -7,7 +7,11 @@
 #include "cec-message.h"
 
 #ifndef CEC_PIN
-#define CEC_PIN 3  // GPIO3 == D10 (Seeed Studio XIAO RP2040)
+#error "CEC_PIN must be defined by the board build"
+#endif
+
+#if CEC_PIN < 0 || CEC_PIN > 29
+#error "CEC_PIN is outside the RP2040 GPIO range"
 #endif
 
 extern TaskHandle_t xCECTask;
@@ -53,6 +57,8 @@ typedef struct {
   uint32_t rx_abort_frames;
   uint32_t tx_noack_frames;
   uint32_t tx_timeout_frames;
+  uint32_t tx_idle_timeout_frames;
+  uint32_t tx_alarm_timeout_frames;
 } cec_frame_stats_t;
 
 void cec_frame_init(void);

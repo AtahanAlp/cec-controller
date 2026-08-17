@@ -3,6 +3,7 @@
 #include <string.h>
 #include <tusb.h>
 
+#include <hardware/gpio.h>
 #include <hardware/watchdog.h>
 #include <pico/bootrom.h>
 
@@ -188,6 +189,8 @@ static int show_stats_cec(void) {
   cdc_printfln("%-13s: %lu frames", "CEC rx abort", stats.rx_abort_frames);
   cdc_printfln("%-13s: %lu frames", "CEC tx noack", stats.tx_noack_frames);
   cdc_printfln("%-13s: %lu frames", "CEC tx timeout", stats.tx_timeout_frames);
+  cdc_printfln("%-13s: %lu frames", "CEC tx idle", stats.tx_idle_timeout_frames);
+  cdc_printfln("%-13s: %lu frames", "CEC tx alarm", stats.tx_alarm_timeout_frames);
 
   return 0;
 }
@@ -240,6 +243,10 @@ static int exec_show(void *arg, int argc, const char **argv) {
     } else if (strcmp(argv[1], "cec") == 0) {
       print_physical_address(cec_get_physical_address());
       print_logical_address(cec_get_logical_address());
+      cdc_printfln("%-17s: GP%u", "CEC GPIO", CEC_PIN);
+      cdc_printfln("%-17s: %s", "CEC direction",
+                   gpio_get_dir(CEC_PIN) == GPIO_OUT ? "output" : "input");
+      cdc_printfln("%-17s: %s", "CEC line", gpio_get(CEC_PIN) ? "high" : "low");
     } else if (strcmp(argv[1], "version") == 0) {
       return show_version(arg);
     } else if (strcmp(argv[1], "nvs") == 0) {
