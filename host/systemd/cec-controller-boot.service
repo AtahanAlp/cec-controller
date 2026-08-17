@@ -1,0 +1,19 @@
+[Unit]
+Description=Wake or stop the TV with the couch PC
+Documentation=https://github.com/AtahanAlp/cec-controller
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/local/bin/cecctl on
+ExecStop=-/usr/local/bin/cecctl standby
+TimeoutStartSec=15s
+TimeoutStopSec=8s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/cec-controller
+
+[Install]
+WantedBy=multi-user.target

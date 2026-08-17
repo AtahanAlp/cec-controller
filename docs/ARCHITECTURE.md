@@ -78,3 +78,12 @@ device timeouts.
 The host locates the controller by stable USB identity rather than assuming a
 particular `/dev/ttyACM*` number. Installation will use standard systemd and
 udev locations; the source tree remains self-contained.
+
+The udev rule creates `/dev/cec-controller` only when the CDC VID/PID and the
+firmware manufacturer/product strings all match. `cecctl` probes `CECCTRL/1`
+before issuing any control operation, so a wrong or incompatible serial device
+cannot be treated as this controller.
+
+The host caches only the last valid physical address. This is necessary because
+some TVs remove hot-plug detect and EDID in standby. It does not cache TV power
+state or run a reconciler; lifecycle events remain the sole policy inputs.

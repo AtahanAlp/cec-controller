@@ -1,0 +1,8 @@
+# Normally auto-detected from the only connected HDMI-A connector.
+# connector=card1-HDMI-A-1
+
+# Deterministic fallback when EDID is unavailable or multiple TVs are attached.
+# physical_address=1.0.0.0
+
+# The installer creates this stable udev link.
+device=/dev/cec-controller

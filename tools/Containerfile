@@ -9,6 +9,7 @@ RUN dnf install -y \
         gcc-c++ \
         git \
         ninja-build \
+        systemd \
     && dnf clean all
 
 WORKDIR /src

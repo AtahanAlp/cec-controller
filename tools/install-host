@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run this installer as root." >&2
+  exit 1
+fi
+
+if [[ ${1:-} == "--uninstall" ]]; then
+  systemctl disable --now cec-controller-boot.service cec-controller-sleep.service || true
+  rm -f \
+    /usr/local/bin/cecctl \
+    /etc/udev/rules.d/70-cec-controller.rules \
+    /etc/systemd/system/cec-controller-boot.service \
+    /etc/systemd/system/cec-controller-sleep.service
+  systemctl daemon-reload
+  udevadm control --reload-rules
+  echo "Removed program, units, and udev rule. Configuration and cached address were retained."
+  exit 0
+fi
+
+if [[ ! -x "$project_dir/build/host/cecctl" ]]; then
+  echo "Build the host client first with ./tools/build-host." >&2
+  exit 1
+fi
+
+install -Dm755 "$project_dir/build/host/cecctl" /usr/local/bin/cecctl
+install -Dm644 "$project_dir/host/udev/70-cec-controller.rules" \
+  /etc/udev/rules.d/70-cec-controller.rules
+install -Dm644 "$project_dir/host/systemd/cec-controller-boot.service" \
+  /etc/systemd/system/cec-controller-boot.service
+install -Dm644 "$project_dir/host/systemd/cec-controller-sleep.service" \
+  /etc/systemd/system/cec-controller-sleep.service
+install -d -m755 /var/lib/cec-controller
+if [[ ! -e /etc/cec-controller.conf ]]; then
+  install -m644 "$project_dir/host/cec-controller.conf.example" /etc/cec-controller.conf
+fi
+if command -v restorecon >/dev/null; then
+  restorecon -F \
+    /usr/local/bin/cecctl \
+    /etc/udev/rules.d/70-cec-controller.rules \
+    /etc/systemd/system/cec-controller-boot.service \
+    /etc/systemd/system/cec-controller-sleep.service \
+    /etc/cec-controller.conf \
+    /var/lib/cec-controller
+fi
+
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=tty
+systemctl daemon-reload
+systemctl enable cec-controller-boot.service cec-controller-sleep.service
+
+echo "Installed and enabled the event-driven services."
+echo "They were not started; complete hardware bring-up, then run:"
+echo "  cecctl detect"
+echo "  cecctl on"
+echo "  systemctl start cec-controller-boot.service"

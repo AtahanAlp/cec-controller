@@ -352,11 +352,14 @@ static const char *tx_result_name(cec_tx_result_t result) {
 
 static int exec_tv(void *arg, int argc, const char **argv) {
   (void)arg;
-  if (argc != 2) {
+  if (argc < 2 || argc > 3) {
     return -1;
   }
 
   if (strcmp(argv[1], "protocol") == 0) {
+    if (argc != 2) {
+      return -1;
+    }
     cdc_printfln("CECCTRL/%u OK command=protocol firmware=%s",
                  CEC_CONTROL_PROTOCOL_VERSION,
                  PICO_CEC_VERSION);
@@ -366,13 +369,43 @@ static int exec_tv(void *arg, int argc, const char **argv) {
   cec_control_result_t result;
   const char *command = argv[1];
   if (strcmp(command, "on") == 0) {
+    if (argc == 3) {
+      if (strlen(argv[2]) != 4) {
+        cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
+                     CEC_CONTROL_PROTOCOL_VERSION);
+        return -1;
+      }
+      for (size_t i = 0; i < 4; i++) {
+        if (!isxdigit((unsigned char)argv[2][i])) {
+          cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
+                       CEC_CONTROL_PROTOCOL_VERSION);
+          return -1;
+        }
+      }
+      char *end = NULL;
+      unsigned long physical_address = strtoul(argv[2], &end, 16);
+      if (end == argv[2] || *end != '\0' || physical_address > UINT16_MAX
+          || !cec_control_valid_physical_address((uint16_t)physical_address)) {
+        cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
+                     CEC_CONTROL_PROTOCOL_VERSION);
+        return -1;
+      }
+      config.physical_address = (uint16_t)physical_address;
+      cec_set_physical_address(config.physical_address);
+    }
     result = cec_control_on(&control_bus,
                             cec_get_logical_address(),
                             cec_get_physical_address(),
                             config.device_type);
   } else if (strcmp(command, "standby") == 0) {
+    if (argc != 2) {
+      return -1;
+    }
     result = cec_control_standby(&control_bus, cec_get_logical_address());
   } else if (strcmp(command, "status") == 0) {
+    if (argc != 2) {
+      return -1;
+    }
     result = cec_control_status(&control_bus, cec_get_logical_address());
   } else {
     return -1;
@@ -454,7 +487,8 @@ static const tclie_cmd_t cmds[] = {
      "{playback|recording}))}"},
     {"show", exec_show, "Show information.",
      "show {cec|config|nvs|(stats {cec|cpu|tasks})|version}"},
-    {"tv", exec_tv, "Control or query the TV.", "tv {on|standby|status|protocol}"},
+    {"tv", exec_tv, "Control or query the TV.",
+     "tv {on [physical_address]|standby|status|protocol}"},
     {"reboot", exec_reboot, "Reboot system.", "reboot [bootsel]"},
 };
 

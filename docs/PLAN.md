@@ -46,8 +46,8 @@ a clean tree.
 - make device discovery and failure behavior deterministic;
 - package installation and removal without scattering files.
 
-Acceptance gate: host tests pass, systemd units verify, and idle steady-state
-resource use is zero because no service remains running.
+Acceptance gate: host tests pass, systemd units verify, and no host client
+process remains running at idle.
 
 ## Phase 4 — hardware bring-up
 

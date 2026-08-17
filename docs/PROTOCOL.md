@@ -24,11 +24,14 @@ device.
 ### Wake and select the PC input
 
 ```text
-> tv on
+> tv on 1000
 CECCTRL/1 OK command=on attempts=1
 ```
 
-The physical address must already be set. `tv on` sends, in order:
+The optional four-digit hexadecimal argument updates the running physical
+address before activation. The host uses this atomic form so it never has to
+rely on prompts from the diagnostic shell. Without the argument, the physical
+address must already be set. `tv on` sends, in order:
 
 1. broadcast `Report Physical Address`;
 2. directed `Image View On`, retried up to three times when necessary;

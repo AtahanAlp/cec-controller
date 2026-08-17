@@ -1,0 +1,22 @@
+[Unit]
+Description=Stop the TV before sleep and wake it after resume
+Documentation=https://github.com/AtahanAlp/cec-controller
+DefaultDependencies=no
+StopWhenUnneeded=yes
+Before=sleep.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/local/bin/cecctl standby
+ExecStop=-/usr/local/bin/cecctl on
+TimeoutStartSec=8s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/cec-controller
+
+[Install]
+WantedBy=sleep.target
