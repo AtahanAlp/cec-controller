@@ -4,12 +4,19 @@
 
 Make a TV behave like a PC monitor: wake it, select the PC input, and put it in
 standby automatically. A Raspberry Pi Pico handles HDMI-CEC and a tiny Linux
-client runs only at boot, shutdown, suspend, and resume—there is no daemon.
+client runs only at boot, shutdown, suspend, and resume (no app consuming
+system resources all the time!).
+
+> **Current support:** The host integration currently supports Linux with
+> systemd and udev. Windows and macOS clients are not yet available, but are
+> planned where practical. TV behavior varies, so only the setups in the
+> compatibility table below should be considered verified.
 
 ## What you need
 
-- original Raspberry Pi Pico (RP2040);
-- spare HDMI cable to cut for CEC;
+- Raspberry Pi Pico (RP2040);
+- spare HDMI cable to cut/modify for CEC (or a female HDMI breakout board and
+  male HDMI cable);
 - USB data cable;
 - normal HDMI connection from the PC to the TV;
 - Podman or Docker for the reproducible build.
@@ -18,8 +25,6 @@ The tested setup is an older Samsung Anynet+ TV, but it uses standard HDMI-CEC
 commands and should work with many CEC-enabled TVs.
 
 ## 1. Wire the Pico
-
-Only two HDMI wires are used:
 
 | HDMI Type A pin | Signal | Raspberry Pi Pico |
 | --- | --- | --- |
@@ -117,6 +122,17 @@ Verified on the test TV: logical-address allocation, power query, standby,
 wake, and automatic switch to HDMI 3 using only CEC and ground. The next step
 is repeated lifecycle testing on the Bazzite couch PC. Compatibility reports
 and native clients for more operating systems are welcome.
+
+## Tested compatibility
+
+| TV | CEC name | Connection | Host test | Standby | Wake | Select input |
+| --- | --- | --- | --- | --- | --- | --- |
+| Older Samsung Smart TV (exact model unknown, replacement mainboard) | Anynet+ | CEC on HDMI 2, video on HDMI 3 | Fedora, manual commands | Yes | Yes | Yes |
+
+Automatic suspend, resume, boot, and shutdown integration on Bazzite is still
+pending real-world testing. Please include the details listed in
+[CONTRIBUTING.md](CONTRIBUTING.md#compatibility-reports) when reporting another
+TV or operating system.
 
 This project is derived from [gkoh/pico-cec](https://github.com/gkoh/pico-cec)
 and retains its original notices. It is available under the
