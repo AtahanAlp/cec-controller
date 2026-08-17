@@ -4,10 +4,40 @@ set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+usage() {
+  cat <<'EOF'
+Usage: sudo ./tools/install-host [--uninstall]
+
+Install or remove cecctl, its udev rule, and its systemd lifecycle units.
+Configuration and the cached HDMI address are retained during uninstall.
+EOF
+}
+
+case ${1:-} in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --uninstall|"")
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
 if [[ ${EUID} -ne 0 ]]; then
   echo "Run this installer as root." >&2
   exit 1
 fi
+
+for command in install systemctl udevadm; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Required command not found: $command" >&2
+    echo "Automatic integration currently requires a Linux system using systemd and udev." >&2
+    exit 1
+  fi
+done
 
 if [[ ${1:-} == "--uninstall" ]]; then
   systemctl disable --now cec-controller-boot.service cec-controller-sleep.service || true
@@ -53,7 +83,7 @@ udevadm trigger --subsystem-match=tty
 systemctl daemon-reload
 systemctl enable cec-controller-boot.service cec-controller-sleep.service
 
-echo "Installed and enabled the event-driven services."
+echo "Installed and enabled the event-driven systemd services."
 echo "They were not started; complete hardware bring-up, then run:"
 echo "  cecctl detect"
 echo "  cecctl on"

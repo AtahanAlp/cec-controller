@@ -27,6 +27,10 @@
 #define DEFAULT_SYSFS_ROOT "/sys/class/drm"
 #define MAX_EDID_SIZE (128U * 256U)
 
+#ifndef CECCTL_VERSION
+#define CECCTL_VERSION "unknown"
+#endif
+
 typedef struct {
   char config[PATH_MAX];
   char device[PATH_MAX];
@@ -39,10 +43,23 @@ typedef struct {
 static void usage(FILE *stream) {
   fprintf(stream,
           "Usage: cecctl [options] {on|standby|status|protocol|detect}\n"
+          "\n"
+          "Commands:\n"
+          "  on                         wake the TV and select the PC input\n"
+          "  standby                    place the TV in standby\n"
+          "  status                     query the TV power state\n"
+          "  protocol                   probe controller compatibility\n"
+          "  detect                     resolve the PC input physical address\n"
+          "\n"
+          "Options:\n"
           "  --device PATH              controller device (default: %s)\n"
           "  --connector NAME           DRM connector basename\n"
           "  --physical-address A.B.C.D override EDID discovery\n"
-          "  --config PATH              config file (default: %s)\n",
+          "  --config PATH              config file (default: %s)\n"
+          "  --state-file PATH          physical-address cache\n"
+          "  --sysfs-root PATH          DRM sysfs root\n"
+          "  --help                     show this help\n"
+          "  --version                  show the client version\n",
           DEFAULT_DEVICE,
           DEFAULT_CONFIG);
 }
@@ -427,6 +444,17 @@ int main(int argc, char **argv) {
   copy_string(options.state_file, sizeof(options.state_file), DEFAULT_STATE_FILE);
   copy_string(options.sysfs_root, sizeof(options.sysfs_root), DEFAULT_SYSFS_ROOT);
 
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0) {
+      usage(stdout);
+      return 0;
+    }
+    if (strcmp(argv[i], "--version") == 0) {
+      printf("cecctl %s\n", CECCTL_VERSION);
+      return 0;
+    }
+  }
+
   for (int i = 1; i + 1 < argc; i++) {
     if (strcmp(argv[i], "--config") == 0) {
       copy_string(options.config, sizeof(options.config), argv[i + 1]);
@@ -439,10 +467,6 @@ int main(int argc, char **argv) {
 
   const char *command = NULL;
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
-      usage(stdout);
-      return 0;
-    }
     if (argv[i][0] != '-') {
       if (command != NULL) {
         usage(stderr);

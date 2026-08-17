@@ -13,7 +13,9 @@ target_compile_options(cecctl-core PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(cecctl src/main.c)
 target_link_libraries(cecctl PRIVATE cecctl-core)
-target_compile_definitions(cecctl PRIVATE _DEFAULT_SOURCE)
+target_compile_definitions(cecctl PRIVATE
+  _DEFAULT_SOURCE
+  CECCTL_VERSION="${PROJECT_VERSION}")
 target_compile_options(cecctl PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 if(BUILD_TESTING)
@@ -31,6 +33,12 @@ if(BUILD_TESTING)
     COMMAND cecctl --config /nonexistent --physical-address 2.1.0.0 detect)
   set_tests_properties(cecctl-manual-address PROPERTIES
     PASS_REGULAR_EXPRESSION "physical_address=2.1.0.0 source=config")
+  add_test(NAME cecctl-help COMMAND cecctl --help)
+  set_tests_properties(cecctl-help PROPERTIES
+    PASS_REGULAR_EXPRESSION "Commands:")
+  add_test(NAME cecctl-version COMMAND cecctl --version)
+  set_tests_properties(cecctl-version PROPERTIES
+    PASS_REGULAR_EXPRESSION "cecctl ${PROJECT_VERSION}")
 endif()
 
 install(TARGETS cecctl RUNTIME DESTINATION bin)
