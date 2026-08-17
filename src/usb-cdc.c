@@ -488,7 +488,7 @@ static const tclie_cmd_t cmds[] = {
     {"show", exec_show, "Show information.",
      "show {cec|config|nvs|(stats {cec|cpu|tasks})|version}"},
     {"tv", exec_tv, "Control or query the TV.",
-     "tv {on [physical_address]|standby|status|protocol}"},
+     CEC_TV_COMMAND_PATTERN},
     {"reboot", exec_reboot, "Reboot system.", "reboot [bootsel]"},
 };
 

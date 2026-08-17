@@ -2,6 +2,8 @@
 #define USB_CDC_H
 
 #define _CDC_BR "\r\n"
+#define CEC_TV_COMMAND_PATTERN \
+  "tv {(on [<physical_address>])|standby|status|protocol}"
 
 /** Print formatted string to USB-CDC output. */
 __attribute__((format(printf, 1, 2))) void cdc_printf(const char *fmt, ...);
