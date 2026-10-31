@@ -1,13 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(cecctl VERSION 0.1.0 LANGUAGES C)
+project(cecctl VERSION 0.2.0 LANGUAGES C)
 
 include(CTest)
 
 add_library(cecctl-core STATIC
   src/edid.c
   src/protocol.c
+  ../src/cec-validate.c
 )
-target_include_directories(cecctl-core PUBLIC include)
+target_include_directories(cecctl-core PUBLIC include ../include)
 target_compile_features(cecctl-core PUBLIC c_std_11)
 target_compile_options(cecctl-core PRIVATE -Wall -Wextra -Wpedantic -Werror)
 

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tools/container-common
 source "$project_dir/tools/container-common"
 
 builder_image="localhost/cec-controller-builder:fedora42"
@@ -11,6 +12,11 @@ version="$(git -C "$project_dir" describe --always --dirty)"
 cec_board="${CEC_BOARD:-pico}"
 cec_gpio="${CEC_GPIO:-11}"
 cec_osd_name="${CEC_OSD_NAME:-Couch PC}"
+
+if [[ ! $cec_board =~ ^[[:alnum:]_-]+$ ]]; then
+  echo "CEC_BOARD must be a Pico SDK board name." >&2
+  exit 2
+fi
 
 if [[ ! $cec_gpio =~ ^[0-9]+$ ]] || ((cec_gpio > 29)); then
   echo "CEC_GPIO must be an RP2040 GPIO number from 0 through 29." >&2
@@ -60,3 +66,12 @@ fi
   --workdir /src \
   "$builder_image" \
   cmake --build "$build_dir"
+
+safe_version="${version//[^[:alnum:]._-]/_}"
+artifact="couch-cec-${cec_board}-gp${cec_gpio}-protocol2-${safe_version}"
+cp "$project_dir/build/firmware/pico-cec.uf2" "$project_dir/build/firmware/$artifact.uf2"
+{
+  printf 'version=%s\nboard=%s\ngpio=%s\nprotocol=2\nosd_name=%s\n' \
+    "$version" "$cec_board" "$cec_gpio" "$cec_osd_name"
+  (cd "$project_dir/build/firmware" && sha256sum "$artifact.uf2")
+} > "$project_dir/build/firmware/$artifact.manifest"

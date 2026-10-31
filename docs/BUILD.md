@@ -94,7 +94,7 @@ tv protocol
 Expected protocol reply:
 
 ```text
-CECCTRL/1 OK command=protocol firmware=<git-version>
+CECCTRL/2 OK command=protocol firmware=<git-version>
 ```
 
 After completing the continuity checks in [HARDWARE.md](HARDWARE.md), connect
@@ -129,3 +129,32 @@ Remove it with the same engine used to build, for example:
 ```sh
 podman image rm localhost/cec-controller-builder:fedora42
 ```
+
+## Identifying the GPIO build
+
+The default build matches the original wiring guide: CEC on GP11 (Pico
+physical pin 15) and ground on physical pin 18. The enclosed couch-PC
+controller uses GP1 (physical pin 2) and ground on physical pin 3; build for it
+with `CEC_GPIO=1 ./tools/build-firmware`. Set `CEC_GPIO` to match any other
+custom wiring.
+
+The builder also writes a named artifact such as
+`couch-cec-pico-gp1-protocol2-<version>.uf2` and a `.manifest` containing the
+board, GPIO, protocol, version, OSD name, and firmware checksum. Update the host
+client together with firmware when changing protocol versions.
+
+The SDK's picotool build is pinned to the official Raspberry Pi picotool 2.2.0
+source commit `a7eb3988f0645239185fadb4e25d8279478c2dbb`. It is built inside
+the existing project builder; no host picotool installation is required.
+
+For remote maintenance, `python3 tools/pico-maintenance.py console` reads USB
+diagnostics. Its `flash` subcommand requires an explicit UF2 SHA-256, GPIO, and
+protocol, validates the flash range (excluding NVS), and matches the runtime and
+BOOTSEL drive to the same physical USB port. Obtain operator confirmation before
+flashing. `--bootloader-port <port>` is an explicit recovery option when a failed
+application is already in BOOTSEL and no runtime tty exists.
+
+Unexpected task stalls are monitored by a watchdog. One watchdog failure
+restarts the firmware; repeated failures enter BOOTSEL so the enclosure need not
+be opened for USB recovery. A healthy 30-second run resets the failure counter.
+Intentional `reboot` and `reboot bootsel` remain available when no operation is busy.

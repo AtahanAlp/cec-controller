@@ -25,6 +25,8 @@ typedef enum {
   CEC_TX_NO_ACK = 2,
   CEC_TX_TIMEOUT = 3,
   CEC_TX_UNAVAILABLE = 4,
+  CEC_TX_ARBITRATION_LOST = 5,
+  CEC_TX_BUS_ERROR = 6,
 } cec_tx_result_t;
 
 #endif

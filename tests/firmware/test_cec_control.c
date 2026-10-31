@@ -1,199 +1,107 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include "cec-control.h"
 #include "cec-id.h"
-
-#define ARRAY_LEN(array) (sizeof(array) / sizeof((array)[0]))
-#define CHECK(condition)                                                              \
-  do {                                                                                \
-    if (!(condition)) {                                                               \
-      fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #condition); \
-      exit(1);                                                                        \
-    }                                                                                 \
-  } while (0)
-
+#include "cec-validate.h"
+#include "cec-config.h"
+#include "cec-health.h"
+#define CHECK(x) do { if (!(x)) { fprintf(stderr,"%s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
 typedef struct {
-  cec_tx_result_t tx_results[8];
-  size_t tx_result_count;
-  size_t tx_result_index;
-  cec_message_t messages[8];
-  size_t message_count;
-  uint32_t delays[8];
-  size_t delay_count;
+  uint64_t now;
+  unsigned sends, queries, power_sends, active_sends;
+  uint8_t opcodes[32];
+  uint8_t status[64]; unsigned status_count, index;
   cec_power_query_result_t query_result;
-  uint8_t query_status;
-  uint8_t query_initiator;
-  uint32_t query_timeout;
-} mock_bus_t;
-
-static cec_tx_result_t mock_send(void *context,
-                                 const cec_message_t *message,
-                                 uint32_t timeout_ms) {
-  mock_bus_t *mock = context;
-  CHECK(timeout_ms == CEC_CONTROL_TX_TIMEOUT_MS);
-  CHECK(mock->message_count < ARRAY_LEN(mock->messages));
-  mock->messages[mock->message_count++] = *message;
-  CHECK(mock->tx_result_index < mock->tx_result_count);
-  return mock->tx_results[mock->tx_result_index++];
+  cec_tx_result_t send_result;
+  bool route;
+  uint64_t target_at, first_active_at, slow_boot_at;
+} mock_t;
+static uint64_t now(void *p) { return ((mock_t *)p)->now; }
+static void delay(void *p, uint32_t duration) { ((mock_t *)p)->now += duration; }
+static cec_tx_result_t send(void *p, const cec_message_t *message, uint32_t timeout) {
+  mock_t *m=p; CHECK(timeout && timeout<=1500); CHECK(cec_message_valid(message));
+  CHECK(m->sends < 32); m->opcodes[m->sends++]=message->opcode;
+  if (message->opcode==CEC_ID_IMAGE_VIEW_ON || message->opcode==CEC_ID_STANDBY) m->power_sends++;
+  if (message->opcode==CEC_ID_ACTIVE_SOURCE) {
+    CHECK(m->queries>=2); if (!m->active_sends++) m->first_active_at=m->now;
+    CHECK(m->now>=m->target_at);
+  }
+  m->now += timeout < 50 ? timeout : 50;
+  return m->send_result;
 }
-
-static void mock_delay(void *context, uint32_t delay_ms) {
-  mock_bus_t *mock = context;
-  CHECK(mock->delay_count < ARRAY_LEN(mock->delays));
-  mock->delays[mock->delay_count++] = delay_ms;
+static cec_power_query_result_t query(void *p,uint8_t address,uint8_t *status,uint32_t timeout) {
+  mock_t *m=p; CHECK(address>0 && address<15); CHECK(timeout && timeout<=2000);
+  m->queries++; m->now += timeout<50 ? timeout : 50;
+  unsigned index=m->index<m->status_count ? m->index++ : (m->status_count ? m->status_count-1:0);
+  *status=m->slow_boot_at ? (m->now < 13000 ? 1 : m->now < m->slow_boot_at ? 2 : 0) : m->status[index];
+  return m->query_result;
 }
-
-static cec_power_query_result_t mock_query(void *context,
-                                           uint8_t initiator,
-                                           uint8_t *power_status,
-                                           uint32_t timeout_ms) {
-  mock_bus_t *mock = context;
-  mock->query_initiator = initiator;
-  mock->query_timeout = timeout_ms;
-  *power_status = mock->query_status;
-  return mock->query_result;
+static bool route(void *p,uint16_t address) { CHECK(address==0x3000); return ((mock_t *)p)->route; }
+static cec_control_bus_t bus(mock_t *m) {
+  return (cec_control_bus_t){.context=m,.send=send,.delay=delay,.query_power=query,.now_ms=now,.routing_confirmed=route};
 }
-
-static cec_control_bus_t make_bus(mock_bus_t *mock) {
-  return (cec_control_bus_t){
-      .context = mock,
-      .send = mock_send,
-      .delay = mock_delay,
-      .query_power = mock_query,
-  };
+static mock_t normal(void) { return (mock_t){.send_result=CEC_TX_ACK,.query_result=CEC_POWER_QUERY_OK,.route=true}; }
+static void wake_waits_for_on(void) {
+  mock_t m=normal(); uint8_t states[]={3,3,1,2,2,2,0,0};
+  memcpy(m.status,states,sizeof(states));m.status_count=sizeof(states);m.target_at=3000;
+  cec_control_bus_t b=bus(&m);cec_control_result_t r=cec_control_on(&b,4,0x3000,4);
+  CHECK(r.code==CEC_CONTROL_OK && r.power_confirmed && r.routing_confirmed);
+  CHECK(m.opcodes[0]==CEC_ID_IMAGE_VIEW_ON);CHECK(m.first_active_at>=m.target_at);
+  CHECK(m.queries>=8 && r.elapsed_ms<20000);
 }
-
-static void test_physical_address_validation(void) {
-  CHECK(cec_control_valid_physical_address(0x1000));
-  CHECK(cec_control_valid_physical_address(0x1200));
-  CHECK(cec_control_valid_physical_address(0x1234));
-  CHECK(!cec_control_valid_physical_address(0x0000));
-  CHECK(!cec_control_valid_physical_address(0xffff));
-  CHECK(!cec_control_valid_physical_address(0x0100));
-  CHECK(!cec_control_valid_physical_address(0x1010));
+static void slow_tv_boot(void) {
+  mock_t m=normal();m.slow_boot_at=22000;m.target_at=22000;cec_control_bus_t b=bus(&m);
+  cec_control_result_t r=cec_control_on(&b,4,0x3000,4);
+  CHECK(r.code==CEC_CONTROL_OK && r.power_confirmed && r.elapsed_ms>22000 && r.elapsed_ms<30000);
 }
-
-static void test_on_success(void) {
-  mock_bus_t mock = {
-      .tx_results = {CEC_TX_NO_ACK, CEC_TX_ACK, CEC_TX_NO_ACK},
-      .tx_result_count = 3,
-  };
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_on(&bus, 0x04, 0x1200, 0x04);
-
-  CHECK(result.code == CEC_CONTROL_OK);
-  CHECK(result.attempts == 1);
-  CHECK(mock.message_count == 3);
-  CHECK(mock.messages[0].header == 0x4f);
-  CHECK(mock.messages[0].opcode == CEC_ID_REPORT_PHYSICAL_ADDRESS);
-  CHECK(mock.messages[0].operand[0] == 0x12);
-  CHECK(mock.messages[0].operand[1] == 0x00);
-  CHECK(mock.messages[0].operand[2] == 0x04);
-  CHECK(mock.messages[1].header == 0x40);
-  CHECK(mock.messages[1].opcode == CEC_ID_IMAGE_VIEW_ON);
-  CHECK(mock.messages[2].header == 0x4f);
-  CHECK(mock.messages[2].opcode == CEC_ID_ACTIVE_SOURCE);
-  CHECK(mock.delay_count == 1);
-  CHECK(mock.delays[0] == CEC_CONTROL_WAKE_DELAY_MS);
+static void standby_waits_then_wake(void) {
+  mock_t m=normal();uint8_t states[]={0,3,3,1,1};memcpy(m.status,states,sizeof(states));m.status_count=sizeof(states);
+  cec_control_bus_t b=bus(&m);cec_control_result_t off=cec_control_standby(&b,4);
+  CHECK(off.code==CEC_CONTROL_OK && off.power_confirmed && m.queries==5);
+  uint64_t finished=m.now; m.status[0]=2;m.status[1]=2;m.status[2]=0;m.status[3]=0;m.status_count=4;m.index=0;
+  cec_control_result_t on=cec_control_on(&b,4,0x3000,4);
+  CHECK(on.code==CEC_CONTROL_OK && m.now>finished);
 }
-
-static void test_on_retries_and_reports_no_ack(void) {
-  mock_bus_t mock = {
-      .tx_results = {
-          CEC_TX_NO_ACK,
-          CEC_TX_NO_ACK,
-          CEC_TX_NO_ACK,
-          CEC_TX_NO_ACK,
-          CEC_TX_NO_ACK,
-      },
-      .tx_result_count = 5,
-  };
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_on(&bus, 0x08, 0x2000, 0x04);
-
-  CHECK(result.code == CEC_CONTROL_NO_ACK);
-  CHECK(result.attempts == CEC_CONTROL_ON_ATTEMPTS);
-  CHECK(mock.message_count == 5);
-  CHECK(mock.messages[4].opcode == CEC_ID_ACTIVE_SOURCE);
-  CHECK(mock.delay_count == 3);
-  CHECK(mock.delays[0] == CEC_CONTROL_RETRY_DELAY_MS);
-  CHECK(mock.delays[1] == CEC_CONTROL_RETRY_DELAY_MS);
-  CHECK(mock.delays[2] == CEC_CONTROL_WAKE_DELAY_MS);
+static void ack_is_not_completion(void) {
+  mock_t m=normal();m.status[0]=2;m.status_count=1;cec_control_bus_t b=bus(&m);
+  cec_control_result_t r=cec_control_on(&b,4,0x3000,4);
+  CHECK(r.code==CEC_CONTROL_TRANSITION_TIMEOUT && !r.power_confirmed && !m.active_sends);
+  CHECK(r.elapsed_ms==30000 && m.power_sends==1);
 }
-
-static void test_on_rejects_invalid_address(void) {
-  mock_bus_t mock = {0};
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_on(&bus, 0x04, 0x0000, 0x04);
-
-  CHECK(result.code == CEC_CONTROL_INVALID_PHYSICAL_ADDRESS);
-  CHECK(mock.message_count == 0);
-
-  result = cec_control_on(&bus, 0x0f, 0x1000, 0x04);
-  CHECK(result.code == CEC_CONTROL_UNAVAILABLE);
-  CHECK(mock.message_count == 0);
+static void missing_feedback_is_failure(void) {
+  mock_t m=normal();m.query_result=CEC_POWER_QUERY_RESPONSE_TIMEOUT;cec_control_bus_t b=bus(&m);
+  cec_control_result_t r=cec_control_standby(&b,4);
+  CHECK(r.code==CEC_CONTROL_RESPONSE_TIMEOUT && !r.power_confirmed && r.elapsed_ms==10000);
+  CHECK(m.power_sends==2);
+  m=normal();m.query_result=CEC_POWER_QUERY_UNSUPPORTED;b=bus(&m);
+  r=cec_control_on(&b,4,0x3000,4);CHECK(r.code==CEC_CONTROL_UNSUPPORTED && m.queries==1);
 }
-
-static void test_on_stops_after_broadcast_timeout(void) {
-  mock_bus_t mock = {
-      .tx_results = {CEC_TX_TIMEOUT},
-      .tx_result_count = 1,
-  };
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_on(&bus, 0x04, 0x1000, 0x04);
-
-  CHECK(result.code == CEC_CONTROL_TX_TIMEOUT);
-  CHECK(result.attempts == 0);
-  CHECK(mock.message_count == 1);
-  CHECK(mock.delay_count == 0);
+static void partial_routing_is_explicit(void) {
+  mock_t m=normal();m.route=false;cec_control_bus_t b=bus(&m);
+  cec_control_result_t r=cec_control_on(&b,4,0x3000,4);
+  CHECK(r.code==CEC_CONTROL_INPUT_UNCONFIRMED && r.power_confirmed && r.source_announced && !r.routing_confirmed);
+  CHECK(m.active_sends==2);
 }
-
-static void test_standby_retry(void) {
-  mock_bus_t mock = {
-      .tx_results = {CEC_TX_NO_ACK, CEC_TX_ACK},
-      .tx_result_count = 2,
-  };
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_standby(&bus, 0x0b);
-
-  CHECK(result.code == CEC_CONTROL_OK);
-  CHECK(result.attempts == 2);
-  CHECK(mock.message_count == 2);
-  CHECK(mock.messages[0].header == 0xb0);
-  CHECK(mock.messages[0].opcode == CEC_ID_STANDBY);
-  CHECK(mock.delay_count == 1);
-  CHECK(mock.delays[0] == CEC_CONTROL_RETRY_DELAY_MS);
+static void limits_and_invalid_inputs(void) {
+  CHECK(cec_health_fresh(5000, 0, 0, 0));
+  CHECK(cec_health_fresh(20000, 0, 19000, 18000));
+  CHECK(!cec_health_fresh(20000, 0, 10000, 19000));
+  CHECK(!cec_health_fresh(20000, 0, 19000, 10000));
+  CHECK(cec_health_fresh(100, UINT32_MAX - 20000, UINT32_MAX - 10, UINT32_MAX - 10));
+  mock_t m=normal();cec_control_bus_t b=bus(&m);
+  CHECK(cec_control_on(&b,4,0xffff,4).code==CEC_CONTROL_INVALID_PHYSICAL_ADDRESS);
+  CHECK(cec_control_on(&b,15,0x3000,4).code==CEC_CONTROL_UNAVAILABLE);CHECK(!m.sends);
+  m.status[0]=2;m.status_count=1;b.deadline_ms=100;
+  cec_control_result_t r=cec_control_on(&b,4,0x3000,4);CHECK(r.elapsed_ms<=100 && r.code!=CEC_CONTROL_OK);
+  m=normal();m.status[0]=255;m.status_count=1;b=bus(&m);
+  CHECK(cec_control_status(&b,4).code!=CEC_CONTROL_OK);
+  CHECK(!cec_physical_address_valid(0xffff) && !cec_physical_address_valid(0x1010));
+  cec_config_t c={0};cec_config_set_default(&c);CHECK(cec_config_valid(&c));
+  c.device_type=255;CHECK(!cec_config_valid(&c));c.device_type=4;memset(c.osd_name,'x',sizeof(c.osd_name));CHECK(!cec_config_valid(&c));
+  cec_message_t msg={.len=17};CHECK(!cec_message_valid(&msg));msg.len=2;msg.opcode=CEC_ID_ROUTING_CHANGE;CHECK(!cec_message_valid(&msg));
 }
-
-static void test_status(void) {
-  mock_bus_t mock = {
-      .query_result = CEC_POWER_QUERY_OK,
-      .query_status = 0x01,
-  };
-  cec_control_bus_t bus = make_bus(&mock);
-  cec_control_result_t result = cec_control_status(&bus, 0x08);
-
-  CHECK(result.code == CEC_CONTROL_OK);
-  CHECK(result.power_status == 0x01);
-  CHECK(mock.query_initiator == 0x08);
-  CHECK(mock.query_timeout == CEC_CONTROL_POWER_TIMEOUT_MS);
-  CHECK(strcmp(cec_control_power_name(result.power_status), "standby") == 0);
-
-  mock.query_result = CEC_POWER_QUERY_RESPONSE_TIMEOUT;
-  result = cec_control_status(&bus, 0x08);
-  CHECK(result.code == CEC_CONTROL_RESPONSE_TIMEOUT);
-}
-
 int main(void) {
-  test_physical_address_validation();
-  test_on_success();
-  test_on_retries_and_reports_no_ack();
-  test_on_rejects_invalid_address();
-  test_on_stops_after_broadcast_timeout();
-  test_standby_retry();
-  test_status();
-  puts("cec-control tests passed");
-  return 0;
+  wake_waits_for_on();slow_tv_boot();standby_waits_then_wake();ack_is_not_completion();missing_feedback_is_failure();
+  partial_routing_is_explicit();limits_and_invalid_inputs();puts("Confirmed power transition regressions passed");return 0;
 }

@@ -6,6 +6,11 @@
 #include <hardware/gpio.h>
 #include <hardware/watchdog.h>
 #include <pico/bootrom.h>
+#include <pico/rand.h>
+#include "FreeRTOS.h"
+#include "queue.h"
+#include "cec-validate.h"
+#include "cec-id.h"
 
 #include "pico-cec/config.h"
 #include "pico-cec/util.h"
@@ -25,73 +30,137 @@ static cec_config_t config = {0x0};
 
 static tclie_t tclie;
 
-static cec_tx_result_t control_send(void *context,
-                                    const cec_message_t *message,
-                                    uint32_t timeout_ms) {
-  (void)context;
-  return cec_send_msg_sync(message, timeout_ms);
-}
+#define OUTPUT_LENGTH 384
+#define OUTPUT_COUNT 8
+#define RESULT_COUNT 8
+static TaskHandle_t parser_task;
+static QueueHandle_t output_queue, operation_queue;
+static StaticQueue_t output_queue_static, operation_queue_static;
+typedef struct { char text[OUTPUT_LENGTH]; } output_t;
+static uint8_t output_storage[OUTPUT_COUNT * sizeof(output_t)];
+static uint64_t session_id;
+static uint64_t manual_id;
+static volatile bool operation_busy;
+static volatile uint32_t heartbeat;
+uint32_t cdc_heartbeat_ms(void) { return heartbeat; }
+static const char *operation_phase = "idle";
+typedef struct { uint64_t id; char command[8]; uint16_t physical; } operation_t;
+static operation_t current_operation;
+static uint8_t operation_storage[sizeof(operation_t)];
+typedef struct { operation_t request; char text[OUTPUT_LENGTH]; } retained_t;
+static retained_t retained[RESULT_COUNT];
+static unsigned retained_next;
+typedef struct { bool activation_started; uint64_t operation_at; } control_context_t;
 
-static void control_delay(void *context, uint32_t delay_ms) {
-  (void)context;
-  vTaskDelay(pdMS_TO_TICKS(delay_ms));
-}
-
-static cec_power_query_result_t control_query_power(void *context,
-                                                    uint8_t initiator,
-                                                    uint8_t *power_status,
-                                                    uint32_t timeout_ms) {
-  (void)context;
-  if (initiator != cec_get_logical_address()) {
-    return CEC_POWER_QUERY_UNAVAILABLE;
+static bool write_usb(const char *str) {
+  size_t length = strlen(str), used = 0;
+  uint64_t deadline = util_uptime_ms() + 200;
+  while (used < length && tud_cdc_connected() && util_uptime_ms() < deadline) {
+    used += tud_cdc_write(str + used, (uint32_t)(length - used));
+    tud_cdc_write_flush();
+    if (used < length) vTaskDelay(pdMS_TO_TICKS(1));
   }
-  return cec_query_power_status(power_status, timeout_ms);
+  return used == length;
 }
-
-static const cec_control_bus_t control_bus = {
-    .context = NULL,
-    .send = control_send,
-    .delay = control_delay,
-    .query_power = control_query_power,
-};
-
-/** Print string to CDC output. */
 static void print(const char *str) {
-  tud_cdc_write_str(str);
-  vTaskDelay(pdMS_TO_TICKS(1));  // needed to avoid garbled output
+  if (xTaskGetCurrentTaskHandle() == parser_task) { (void)write_usb(str); return; }
+  output_t item;
+  if (snprintf(item.text, sizeof(item.text), "%s", str) >= (int)sizeof(item.text)) return;
+  if (output_queue) xQueueSend(output_queue, &item, pdMS_TO_TICKS(100));
 }
-
-/** tcli print callback function. */
-static void tcli_print(void *arg, const char *str) {
-  print(str);
-}
-
-/** Print formatted string with variadic parameter list. */
-static void cdc_vprintf(const char *fmt, va_list ap) {
-  char buffer[128] = {0x00};
-  vsnprintf(buffer, 128, fmt, ap);
+static void tcli_print(void *arg, const char *str) { (void)arg; print(str); }
+static void cdc_vprintf(const char *fmt, va_list ap, bool newline) {
+  char buffer[OUTPUT_LENGTH];
+  int length = vsnprintf(buffer, sizeof(buffer) - 2, fmt, ap);
+  if (length < 0 || length >= (int)sizeof(buffer) - 2) return;
+  if (newline) { buffer[length++] = '\r'; buffer[length++] = '\n'; buffer[length] = 0; }
   print(buffer);
 }
-
 void cdc_log(const char *str) {
-  tclie_log(&tclie, str);
+  if (!output_queue || uxQueueSpacesAvailable(output_queue) < 2) return;
+  output_t item;
+  snprintf(item.text, sizeof(item.text), "%s", str);
+  xQueueSend(output_queue, &item, 0);
 }
-
-/** Print formatted string. */
 void cdc_printf(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  cdc_vprintf(fmt, ap);
-  va_end(ap);
+  va_list ap; va_start(ap, fmt); cdc_vprintf(fmt, ap, false); va_end(ap);
+}
+void cdc_printfln(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt); cdc_vprintf(fmt, ap, true); va_end(ap);
 }
 
-/** Print formatted string with newline. */
-void cdc_printfln(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  cdc_vprintf(fmt, ap);
-  va_end(ap);
-  print(_CDC_BR);
+static cec_tx_result_t control_send(void *context, const cec_message_t *message, uint32_t timeout) {
+  control_context_t *state = context;
+  if (!tud_cdc_connected()) return CEC_TX_UNAVAILABLE;
+  operation_phase = message->opcode == CEC_ID_ACTIVE_SOURCE || message->opcode == CEC_ID_REPORT_PHYSICAL_ADDRESS
+                  ? "activate" : "power";
+  if (message->opcode == CEC_ID_ACTIVE_SOURCE) {
+    if (!state->activation_started) {
+      state->activation_started = true;
+      cec_set_source_active(true);
+    } else if (!cec_source_active()) return CEC_TX_UNAVAILABLE;
+  }
+  return cec_send_msg_sync(message, timeout);
+}
+static void control_delay(void *context, uint32_t duration) {
+  (void)context; if (duration) vTaskDelay(pdMS_TO_TICKS(duration));
+}
+static uint64_t control_now(void *context) { (void)context; return util_uptime_ms(); }
+static cec_power_query_result_t control_query(void *context, uint8_t initiator,
+                                              uint8_t *status, uint32_t timeout) {
+  (void)context;
+  if (!tud_cdc_connected() || initiator != cec_get_logical_address()) return CEC_POWER_QUERY_UNAVAILABLE;
+  return cec_query_power_status(status, timeout);
+}
+static bool control_route(void *context, uint16_t physical) {
+  control_context_t *state = context;
+  return cec_source_active() && cec_routing_confirmed(physical, state->operation_at);
+}
+static void operation_worker(void *context) {
+  (void)context;
+  operation_t request;
+  while (true) {
+    xQueueReceive(operation_queue, &request, portMAX_DELAY);
+    operation_phase = "ready";
+    uint64_t started_us = time_us_64();
+    uint64_t started = started_us / 1000;
+    uint32_t limit = strcmp(request.command, "on") == 0 ? CEC_CONTROL_ON_TIMEOUT_MS
+                   : strcmp(request.command, "standby") == 0 ? CEC_CONTROL_STANDBY_TIMEOUT_MS
+                   : CEC_CONTROL_STATUS_TIMEOUT_MS;
+    uint64_t deadline = started + limit;
+    while (!cec_ready() && util_uptime_ms() + 50 < deadline && tud_cdc_connected())
+      vTaskDelay(pdMS_TO_TICKS(50));
+    control_context_t state = { .operation_at = started_us };
+    cec_control_bus_t bus = { .context = &state, .send = control_send,
+      .delay = control_delay, .query_power = control_query, .now_ms = control_now,
+      .routing_confirmed = control_route, .deadline_ms = deadline };
+    cec_control_result_t result = { .code = CEC_CONTROL_UNAVAILABLE,
+      .power_status = 255, .phase = "ready" };
+    if (cec_ready() && tud_cdc_connected() && util_uptime_ms() < deadline) {
+      if (strcmp(request.command, "on") == 0) {
+        config.physical_address = request.physical;
+        cec_set_physical_address(request.physical);
+        result = cec_control_on(&bus, cec_get_logical_address(), request.physical, config.device_type);
+      } else if (strcmp(request.command, "standby") == 0) {
+        cec_set_source_active(false);
+        result = cec_control_standby(&bus, cec_get_logical_address());
+      } else { operation_phase = "status"; result = cec_control_status(&bus, cec_get_logical_address()); }
+    }
+    result.elapsed_ms = (uint32_t)(util_uptime_ms() - started);
+    retained_t entry = { .request = request };
+    snprintf(entry.text, sizeof(entry.text),
+      "\r\nCECCTRL/2 %s command=%s id=%016llx session=%016llx code=%s power=%s value=%u verified=%u source=%s routing=%s attempts=%u elapsed_ms=%lu phase=%s\r\n",
+      result.code == CEC_CONTROL_OK ? "OK" : "ERR", request.command,
+      (unsigned long long)request.id, (unsigned long long)session_id,
+      cec_control_result_name(result.code), cec_control_power_name(result.power_status),
+      result.power_status, result.power_confirmed, result.source_announced ? "announced" : "none",
+      result.routing_confirmed ? "confirmed" : "unconfirmed", result.attempts,
+      (unsigned long)result.elapsed_ms, result.phase);
+    taskENTER_CRITICAL(); retained[retained_next] = entry;
+    retained_next = (retained_next + 1) % RESULT_COUNT; taskEXIT_CRITICAL();
+    print(entry.text);
+    operation_busy = false; operation_phase = "idle";
+  }
 }
 
 static int show_version(void *arg) {
@@ -114,13 +183,15 @@ static int exec_debug(void *arg, int argc, const char *argv[]) {
 }
 
 static int exec_reboot(void *arg, int argc, const char **argv) {
+  if (operation_busy) { cdc_printfln("Controller busy; wait for the active operation."); return -1; }
   if ((argc == 2) && (strcmp(argv[1], "bootsel") == 0)) {
     // reboot into USB bootloader
 #ifdef PICO_DEFAULT_LED_PIN
-    uint32_t activity_mask = PICO_DEFAULT_LED_PIN;
+    uint32_t activity_mask = 1u << PICO_DEFAULT_LED_PIN;
 #else
     uint32_t activity_mask = 0;
 #endif
+    watchdog_disable();
     reset_usb_boot(activity_mask, 0);
   } else {
     // normal reboot
@@ -191,6 +262,8 @@ static int show_stats_cec(void) {
   cdc_printfln("%-13s: %lu frames", "CEC tx timeout", stats.tx_timeout_frames);
   cdc_printfln("%-13s: %lu frames", "CEC tx idle", stats.tx_idle_timeout_frames);
   cdc_printfln("%-13s: %lu frames", "CEC tx alarm", stats.tx_alarm_timeout_frames);
+  cdc_printfln("%-13s: %lu frames", "Arbitration", stats.tx_arbitration_frames);
+  cdc_printfln("%-13s: %lu frames", "Bus error", stats.tx_bus_error_frames);
 
   return 0;
 }
@@ -274,9 +347,11 @@ static int exec_show(void *arg, int argc, const char **argv) {
 }
 
 static int exec_save(void *arg, int argc, const char **argv) {
+  if (operation_busy) { cdc_printfln("Controller busy; wait for the active operation."); return -1; }
   // UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
   // cdc_printfln("StackHighWaterMark = %lu", uxHighWaterMark);
 
+  if (!cec_frame_idle()) { cdc_printfln("CEC bus busy; retry save when idle."); return -1; }
   bool r = nvs_save_config(&config);
 
   // cdc_printfln("r = %u", r);
@@ -285,62 +360,39 @@ static int exec_save(void *arg, int argc, const char **argv) {
 }
 
 static int exec_set(void *arg, int argc, const char **argv) {
-  if (argc == 4) {
-    if (strcmp(argv[1], "config") == 0) {
-      if (strcmp(argv[2], "edid_delay_ms") == 0) {
-        config.edid_delay_ms = atoi(argv[3]);
-        print_edid_delay(config.edid_delay_ms);
-        return 0;
-      } else if (strcmp(argv[2], "physical_address") == 0) {
-        if (sscanf(argv[3], "%4hx", &config.physical_address) == 1) {
-          cec_set_physical_address(config.physical_address);
-          print_physical_address(config.physical_address);
-          return 0;
-        } else {
-          cdc_printfln("Error parsing physical address");
-          return -1;
-        }
-      } else if (strcmp(argv[2], "logical_address") == 0) {
-        if (sscanf(argv[3], "%hhx", &config.logical_address) == 1) {
-          config.logical_address &= 0x0f;  // valid is 00 to 0f
-          print_logical_address(config.logical_address);
-          return 0;
-        } else {
-          cdc_printfln("Error parsing logical address");
-          return -1;
-        }
-      } else if (strcmp(argv[2], "device_type") == 0) {
-        if (strcmp(argv[3], "playback") == 0) {
-          config.device_type = CEC_CONFIG_DEVICE_TYPE_PLAYBACK;
-          return 0;
-        } else if (strcmp(argv[3], "recording") == 0) {
-          config.device_type = CEC_CONFIG_DEVICE_TYPE_RECORDING;
-          return 0;
-        } else {
-          cdc_printfln("Unknown device type \'%s\'", argv[3]);
-          return -1;
-        }
-      } else if (strcmp(argv[2], "osd_name") == 0) {
-        if (strlen(argv[3]) > CEC_OSD_NAME_MAX_LEN) {
-          cdc_printfln("OSD name too long (max %d characters)", CEC_OSD_NAME_MAX_LEN);
-          return -1;
-        }
-        for (size_t i = 0; argv[3][i] != '\0'; i++) {
-          if (!isprint((unsigned char)argv[3][i])) {
-            cdc_printfln("OSD name contains non-printable characters");
-            return -1;
-          }
-        }
-        size_t len = strlen(argv[3]);
-        memcpy(config.osd_name, argv[3], len);
-        config.osd_name[len] = '\0';
-        print_osd_name(config.osd_name);
-        return 0;
-      }
-    }
+  (void)arg;
+  if (operation_busy) { cdc_printfln("Controller busy; wait for the active operation."); return -1; }
+  if (argc != 4 || strcmp(argv[1], "config")) return -1;
+  cec_config_t candidate = config;
+  const char *key = argv[2], *value = argv[3];
+  if (!strcmp(key, "osd_name")) {
+    if (strlen(value) > CEC_OSD_NAME_MAX_LEN) return -1;
+    snprintf(candidate.osd_name, sizeof(candidate.osd_name), "%s", value);
+  } else if (!strcmp(key, "device_type")) {
+    if (!strcmp(value, "playback")) candidate.device_type = CEC_CONFIG_DEVICE_TYPE_PLAYBACK;
+    else if (!strcmp(value, "recording")) candidate.device_type = CEC_CONFIG_DEVICE_TYPE_RECORDING;
+    else return -1;
+    candidate.logical_address = 15;
+  } else {
+    if (!*value || *value == '-' || *value == '+') return -1;
+    bool decimal = !strcmp(key, "edid_delay_ms");
+    for (const char *p = value; *p; p++)
+      if (!(decimal ? isdigit((unsigned char)*p) : isxdigit((unsigned char)*p))) return -1;
+    char *end; unsigned long n = strtoul(value, &end, decimal ? 10 : 16);
+    if (*end) return -1;
+    if (decimal) { if (n > 30000) return -1; candidate.edid_delay_ms = (uint32_t)n; }
+    else if (!strcmp(key, "physical_address")) {
+      if (strlen(value) != 4 || !cec_physical_address_valid((uint16_t)n)) return -1;
+      candidate.physical_address = (uint16_t)n;
+    } else if (!strcmp(key, "logical_address")) {
+      if (strlen(value) > 2 || n > 15 || n == 0) return -1;
+      candidate.logical_address = (uint8_t)n;
+    } else return -1;
   }
-
-  return -1;
+  if (!cec_config_valid(&candidate)) return -1;
+  config = candidate;
+  cec_apply_config(&config);
+  return show_config(&config);
 }
 
 static const char *tx_result_name(cec_tx_result_t result) {
@@ -351,97 +403,80 @@ static const char *tx_result_name(cec_tx_result_t result) {
       return "no_ack";
     case CEC_TX_TIMEOUT:
       return "timeout";
+    case CEC_TX_ARBITRATION_LOST:
+      return "arbitration_lost";
+    case CEC_TX_BUS_ERROR:
+      return "bus_error";
     case CEC_TX_UNAVAILABLE:
     default:
       return "unavailable";
   }
 }
 
+static void operation_error(const char *command, uint64_t id, const char *code) {
+  cdc_printfln("CECCTRL/2 ERR command=%s id=%016llx session=%016llx code=%s",
+               command, (unsigned long long)id, (unsigned long long)session_id, code);
+}
+static bool parse_id(const char *text, uint64_t *id) {
+  if (!*text || strlen(text) > 16) return false;
+  for (const char *p = text; *p; p++) if (!isxdigit((unsigned char)*p)) return false;
+  char *end; *id = strtoull(text, &end, 16);
+  return !*end && *id != 0;
+}
 static int exec_tv(void *arg, int argc, const char **argv) {
   (void)arg;
-  if (argc < 2 || argc > 3) {
-    return -1;
-  }
-
-  if (strcmp(argv[1], "protocol") == 0) {
-    if (argc != 2) {
-      return -1;
-    }
-    cdc_printfln("CECCTRL/%u OK command=protocol firmware=%s",
-                 CEC_CONTROL_PROTOCOL_VERSION,
-                 PICO_CEC_VERSION);
-    return 0;
-  }
-
-  cec_control_result_t result;
+  if (argc < 2 || argc > 4) return -1;
   const char *command = argv[1];
-  if (strcmp(command, "on") == 0) {
-    if (argc == 3) {
-      if (strlen(argv[2]) != 4) {
-        cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
-                     CEC_CONTROL_PROTOCOL_VERSION);
-        return -1;
-      }
-      for (size_t i = 0; i < 4; i++) {
-        if (!isxdigit((unsigned char)argv[2][i])) {
-          cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
-                       CEC_CONTROL_PROTOCOL_VERSION);
-          return -1;
-        }
-      }
-      char *end = NULL;
-      unsigned long physical_address = strtoul(argv[2], &end, 16);
-      if (end == argv[2] || *end != '\0' || physical_address > UINT16_MAX
-          || !cec_control_valid_physical_address((uint16_t)physical_address)) {
-        cdc_printfln("CECCTRL/%u ERR command=on code=invalid_physical_address attempts=0",
-                     CEC_CONTROL_PROTOCOL_VERSION);
-        return -1;
-      }
-      config.physical_address = (uint16_t)physical_address;
-      cec_set_physical_address(config.physical_address);
-    }
-    result = cec_control_on(&control_bus,
-                            cec_get_logical_address(),
-                            cec_get_physical_address(),
-                            config.device_type);
-  } else if (strcmp(command, "standby") == 0) {
-    if (argc != 2) {
-      return -1;
-    }
-    result = cec_control_standby(&control_bus, cec_get_logical_address());
-  } else if (strcmp(command, "status") == 0) {
-    if (argc != 2) {
-      return -1;
-    }
-    result = cec_control_status(&control_bus, cec_get_logical_address());
-  } else {
-    return -1;
-  }
-
-  if (result.code == CEC_CONTROL_OK) {
-    if (strcmp(command, "status") == 0) {
-      cdc_printfln("CECCTRL/%u OK command=status power=%s value=%u",
-                   CEC_CONTROL_PROTOCOL_VERSION,
-                   cec_control_power_name(result.power_status),
-                   result.power_status);
-    } else {
-      cdc_printfln("CECCTRL/%u OK command=%s attempts=%u",
-                   CEC_CONTROL_PROTOCOL_VERSION,
-                   command,
-                   result.attempts);
-    }
+  if (strcmp(command, "protocol") == 0 && argc == 2) {
+    cdc_printfln("CECCTRL/2 OK command=protocol firmware=%s session=%016llx on_ms=%u standby_ms=%u status_ms=%u gpio=%u ready=%u busy=%u active=%016llx phase=%s",
+      PICO_CEC_VERSION, (unsigned long long)session_id, CEC_CONTROL_ON_TIMEOUT_MS,
+      CEC_CONTROL_STANDBY_TIMEOUT_MS, CEC_CONTROL_STATUS_TIMEOUT_MS, CEC_PIN, cec_ready(), operation_busy,
+      (unsigned long long)(operation_busy ? current_operation.id : 0), operation_phase);
     return 0;
   }
-
-  cdc_printfln("CECCTRL/%u ERR command=%s code=%s attempts=%u",
-               CEC_CONTROL_PROTOCOL_VERSION,
-               command,
-               cec_control_result_name(result.code),
-               result.attempts);
-  return -1;
+  operation_t request = { .id = ++manual_id, .physical = cec_get_physical_address() };
+  bool on = strcmp(command, "on") == 0;
+  bool result_query = strcmp(command, "result") == 0;
+  if (!on && !result_query && strcmp(command, "standby") != 0 && strcmp(command, "status") != 0) return -1;
+  if ((!on && argc > 3) || (result_query && argc != 3)) return -1;
+  if (on && argc >= 3) {
+    unsigned physical; char extra;
+    if (strlen(argv[2]) != 4 || sscanf(argv[2], "%4x%c", &physical, &extra) != 1
+        || !cec_physical_address_valid((uint16_t)physical)) {
+      operation_error(command, request.id, "invalid_physical_address"); return -1;
+    }
+    request.physical = (uint16_t)physical;
+  }
+  int id_index = on ? 3 : 2;
+  if (argc > id_index && !parse_id(argv[id_index], &request.id)) return -1;
+  snprintf(request.command, sizeof(request.command), "%s", command);
+  retained_t cached = {0};
+  taskENTER_CRITICAL();
+  for (unsigned i = 0; i < RESULT_COUNT; i++) {
+    if (retained[i].request.id == request.id) { cached = retained[i]; break; }
+  }
+  taskEXIT_CRITICAL();
+  if (cached.request.id) {
+    if (!result_query && (strcmp(cached.request.command, command) != 0
+                         || (on && cached.request.physical != request.physical))) {
+      operation_error(command, request.id, "id_conflict"); return -1;
+    }
+    print(cached.text); return 0;
+  }
+  if (operation_busy) { operation_error(command, request.id, "busy"); return -1; }
+  if (result_query) { operation_error(command, request.id, "unknown_request"); return -1; }
+  if (on && !cec_physical_address_valid(request.physical)) {
+    operation_error(command, request.id, "invalid_physical_address"); return -1;
+  }
+  operation_busy = true; current_operation = request;
+  if (xQueueSend(operation_queue, &request, 0) != pdTRUE) {
+    operation_busy = false; operation_error(command, request.id, "busy"); return -1;
+  }
+  return 0;
 }
 
 static int exec_send(void *arg, int argc, const char **argv) {
+  if (operation_busy) { cdc_printfln("Controller busy; wait for the active operation."); return -1; }
   (void)arg;
   if (argc >= 3) {
     unsigned int address = 0;
@@ -471,7 +506,7 @@ static int exec_send(void *arg, int argc, const char **argv) {
       if (success) {
         cdc_printfln("CECCTRL/%u OK command=send result=%s",
                      CEC_CONTROL_PROTOCOL_VERSION,
-                     tx_result_name(result));
+                     address == 0x0f ? "complete" : tx_result_name(result));
         return 0;
       }
       cdc_printfln("CECCTRL/%u ERR command=send code=%s",
@@ -502,12 +537,24 @@ static const tclie_cmd_t cmds[] = {
 void cdc_task(void *params) {
   (void)params;
 
+  parser_task = xTaskGetCurrentTaskHandle();
+  session_id = get_rand_64(); if (!session_id) session_id = 1;
+  manual_id = session_id;
+  output_queue = xQueueCreateStatic(OUTPUT_COUNT, sizeof(output_t), output_storage, &output_queue_static);
+  operation_queue = xQueueCreateStatic(1, sizeof(operation_t), operation_storage, &operation_queue_static);
+  static StackType_t worker_stack[1536]; static StaticTask_t worker_tcb;
+  xTaskCreateStatic(operation_worker, "control", 1536, NULL, 1, worker_stack, &worker_tcb);
   nvs_load_config(&config);
 
   tclie_init(&tclie, tcli_print, NULL);
   tclie_reg_cmds(&tclie, cmds, ARRAY_SIZE(cmds));
 
   while (1) {
+    heartbeat = (uint32_t)util_uptime_ms();
+    output_t output;
+    while (xQueueReceive(output_queue, &output, 0) == pdTRUE) {
+      if (tud_cdc_connected()) (void)write_usb(output.text);
+    }
     // connected() check for DTR bit
     // Most but not all terminal client set this when making connection
     if (tud_cdc_connected()) {
@@ -515,6 +562,8 @@ void cdc_task(void *params) {
       while (tud_cdc_available()) {
         uint8_t c = tud_cdc_read_char();
         tclie_in_char(&tclie, c);
+        if (xQueueReceive(output_queue, &output, 0) == pdTRUE)
+          (void)write_usb(output.text);
       }
 
       tud_cdc_write_flush();
@@ -531,9 +580,9 @@ void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
 
   if (dtr) {
     // Terminal connected
-    tud_cdc_write_str("Connected" _CDC_BR);
+    print("Connected" _CDC_BR);
   } else {
     // Terminal disconnected
-    tud_cdc_write_str("Disconnected" _CDC_BR);
+    print("Disconnected" _CDC_BR);
   }
 }

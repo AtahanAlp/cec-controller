@@ -42,6 +42,7 @@ static void test_addresses(void) {
   assert(cecctl_parse_physical_address("0.0.0.0", &address) != 0);
   assert(cecctl_parse_physical_address("1.0.2.0", &address) != 0);
   assert(cecctl_parse_physical_address("10000", &address) != 0);
+  assert(cecctl_parse_physical_address("ffff", &address) != 0);
   char formatted[8];
   cecctl_format_physical_address(0x3210, formatted);
   assert(strcmp(formatted, "3.2.1.0") == 0);
@@ -68,16 +69,19 @@ static void test_edid(void) {
 
 static void test_replies(void) {
   cecctl_reply_t reply;
-  assert(cecctl_parse_reply("CECCTRL/1 OK command=on attempts=2", "on", &reply) == 0);
-  assert(reply.ok && reply.attempts == 2);
-  assert(cecctl_parse_reply("> CECCTRL/1 ERR command=standby code=no_ack attempts=2",
-                            "standby", &reply) == 1);
-  assert(!reply.ok && strcmp(reply.code, "no_ack") == 0);
-  assert(cecctl_parse_reply("CECCTRL/2 OK command=on", "on", &reply) < 0);
+  const char *protocol = "CECCTRL/2 OK command=protocol firmware=test session=0000000000000001 on_ms=20000 standby_ms=10000 status_ms=3000 gpio=1 ready=1 busy=0";
+  assert(cecctl_parse_reply(protocol, "protocol", &reply) == 0);
+  assert(reply.on_ms == 20000 && reply.gpio == 1);
+  assert(cecctl_parse_reply("CECCTRL/1 OK command=protocol firmware=old", "protocol", &reply) == -2);
+  const char *status = "CECCTRL/2 OK command=status id=0000000000000002 session=0000000000000001 code=ok power=on value=0 verified=1 source=none routing=unconfirmed attempts=1 elapsed_ms=30 phase=status";
+  assert(cecctl_parse_reply(status, "status", &reply) == 0 && reply.id == 2);
+  assert(cecctl_parse_reply("CECCTRL/2 OK command=status id=0000000000000002 session=0000000000000001 code=ok", "status", &reply) < 0);
+  assert(cecctl_parse_reply("CECCTRL/2 ERR command=on id=0000000000000002 session=0000000000000001", "on", &reply) < 0);
+  assert(cecctl_parse_reply("CECCTRL/2 ERR command=on id=0000000000000002 session=0000000000000001 code=busy code=ok", "on", &reply) < 0);
+  assert(cecctl_parse_reply("CECCTRL/2 ERR command=on id=0000000000000002 session=0000000000000001 code=busy", "on", &reply) == 1);
+  assert(cecctl_parse_reply("CECCTRL/2 OK command=on id=0000000000000002 session=0000000000000001 code=ok power=on value=0 verified=0 source=announced routing=confirmed attempts=1 elapsed_ms=30 phase=activate", "on", &reply) < 0);
+  assert(cecctl_parse_reply("CECCTRL/2 OK command=status id=0000000000000002 session=0000000000000001 code=ok power=on value=1 verified=1 source=none routing=unconfirmed attempts=1 elapsed_ms=30 phase=status", "status", &reply) < 0);
   assert(cecctl_parse_reply("noise", "on", &reply) < 0);
-  assert(cecctl_parse_reply("CECCTRL/1 OK command=status power=standby value=1", "status",
-                            &reply) == 0);
-  assert(strcmp(reply.power, "standby") == 0);
 }
 
 int main(void) {

@@ -70,7 +70,9 @@ int main(void) {
   check_command("tv on\r", 2, "on", "");
   check_command("tv on 1200\r", 3, "on", "1200");
 
-  CHECK(run_command("tv standby 1200\r").calls == 0);
+  check_command("tv standby 1200\r", 3, "standby", "1200");
+  check_command("tv on 1200 1234\r", 4, "on", "");
+  check_command("tv result 1234\r", 3, "result", "1234");
   CHECK(run_command("tv protocol extra\r").calls == 0);
   CHECK(run_command("tv unknown\r").calls == 0);
 

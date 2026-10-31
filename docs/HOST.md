@@ -78,3 +78,25 @@ sudo ./tools/install-host --uninstall
 
 Uninstall retains the configuration and cached address so a later reinstall
 does not discard user choices.
+
+## Confirmed operations (client 0.2 / protocol 2)
+
+Update firmware and host together. The client waits for a terminal result with
+the matching request and controller session. It returns 0 for a verified result,
+5 for a controller error, 6 for confirmed power with unconfirmed input selection,
+and 4 for serial/version/ownership failures.
+
+The client serializes access across manual commands and lifecycle services.
+Firmware retains operation ownership until confirmed state or a bounded failure;
+rapid off/on commands must not overlap. A power operation may take up to 30 s
+for wake or 10 s for standby, so install the updated service timeout values too.
+TVs without usable status feedback return explicit failures.
+
+Cached addresses are bound to a DRM connector and EDID identity. Version-1 cache
+files are ignored; a fresh successful EDID detection repopulates the version-2
+cache. If EDID is unavailable, configure the PC's physical input explicitly.
+
+`tools/validate-tv.py` records protocol/status feedback without changing PC power.
+The explicit `--power-cycles` option exercises sequential TV standby/wake and
+requires operator confirmation. A report records power verification and routing
+evidence separately; the visible TV input still needs operator observation.

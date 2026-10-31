@@ -21,10 +21,11 @@ Open the serial console at 115200 baud and enter `tv protocol`. It must return
 a line beginning with:
 
 ```text
-CECCTRL/1 OK command=protocol
+CECCTRL/2 OK command=protocol
 ```
 
-If it says `Unknown command`, flash the current UF2.
+Both client and firmware must support protocol 2. A version mismatch fails before
+a power command; update both components together.
 
 ## CEC line is low
 
@@ -60,3 +61,20 @@ CEC errors are logged but intentionally never block PC sleep or shutdown.
 For an issue report, include TV/OS details plus `cecctl protocol`,
 `cecctl detect`, `cecctl status`, and firmware `show stats cec` output. Remove
 USB serial numbers from logs before posting.
+
+## ACK, timeout, and partial results
+
+An ACK does not establish completed wake or standby. Commands wait for stable TV
+power reports and return `transition_timeout`, `response_timeout`, or
+`unsupported_feedback` if the target cannot be confirmed. Capture the phase,
+reported power, elapsed time, and CEC counters instead of increasing every delay.
+
+`input_unconfirmed` / client exit 6 means power was confirmed but routing was
+not. Check the actual TV input; some TVs provide no usable routing evidence.
+A `busy` response means a previous operation is still owned by the controller.
+Do not reset it or issue raw power commands to bypass confirmation.
+
+Confirm that `CEC GPIO` matches the wired pin after flashing. The enclosed
+couch-PC controller uses GP1 and is built with `CEC_GPIO=1`; the generic build
+defaults to GP11. Voltage on a disconnected, undriven CEC line cannot identify
+which GPIO is wired.

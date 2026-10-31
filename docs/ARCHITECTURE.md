@@ -52,16 +52,17 @@ example and must be replaced with the real GPU input's address.
 
 ```text
 boot/resume
-    -> configure or confirm physical address
-    -> advertise playback device
-    -> Image View On
-    -> bounded wake delay
-    -> Active Source
+    -> own serial device and probe protocol/session
+    -> resolve PC input address
+    -> request wake with unique ID
+    -> Image View On, then confirm stable reported On
+    -> advertise physical address and Active Source
+    -> record power and routing verification separately
 
 suspend/shutdown
-    -> directed Standby
-    -> wait briefly for transmission result
-    -> allow the host transition to continue even if CEC fails
+    -> own serial device and request Standby
+    -> confirm stable reported Standby or reach the bounded deadline
+    -> log terminal result, then allow host transition to continue
 ```
 
 CEC failure must never prevent the PC from suspending or shutting down. It
@@ -80,10 +81,28 @@ particular `/dev/ttyACM*` number. Installation will use standard systemd and
 udev locations; the source tree remains self-contained.
 
 The udev rule creates `/dev/cec-controller` only when the CDC VID/PID and the
-firmware manufacturer/product strings all match. `cecctl` probes `CECCTRL/1`
+firmware manufacturer/product strings all match. `cecctl` probes `CECCTRL/2`
 before issuing any control operation, so a wrong or incompatible serial device
 cannot be treated as this controller.
 
 The Linux host caches only the last valid physical address. This is necessary because
 some TVs remove hot-plug detect and EDID in standby. It does not cache TV power
 state or run a reconciler; lifecycle events remain the sole policy inputs.
+
+## Operation ownership and recovery
+
+The CDC parser owns shell access and USB output. A static control worker owns
+one high-level operation at a time while the CEC task continues to transmit and
+receive. New power requests receive `busy` rather than becoming deferred effects.
+Internal request generations and deadlines prevent late completions from being
+reused. Received messages are dispatched before queued transmissions, with a
+bounded ISR receive queue and incomplete-frame recovery.
+
+Host processes take a device lock and exclusive tty access before configuration
+or traffic. USB IDs and the controller boot identity correlate terminal results;
+CEC itself has no matching transaction ID for power reports. TV sender, report
+length/value, receive time, and repeated observations constrain confirmation.
+The address cache stores connector and EDID identity; ambiguous live outputs
+cannot be replaced silently with cached data.
+
+See [protocol details](PROTOCOL.md) and [troubleshooting](TROUBLESHOOTING.md).

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "cecctl.h"
+#include "cec-validate.h"
 
 #define EDID_BLOCK_SIZE 128U
 #define EDID_EXTENSION_COUNT 126U
@@ -12,20 +13,7 @@
 #define CTA_VENDOR_BLOCK 0x03U
 
 bool cecctl_valid_physical_address(uint16_t address) {
-  if (address == 0) {
-    return false;
-  }
-
-  bool zero_seen = false;
-  for (int shift = 12; shift >= 0; shift -= 4) {
-    uint8_t nibble = (uint8_t)((address >> shift) & 0x0f);
-    if (nibble == 0) {
-      zero_seen = true;
-    } else if (zero_seen) {
-      return false;
-    }
-  }
-  return true;
+  return cec_physical_address_valid(address);
 }
 
 int cecctl_parse_physical_address(const char *text, uint16_t *address) {

@@ -71,6 +71,11 @@ build/host/cecctl --config /nonexistent --device $device on
 If `detect` cannot identify the video input, add its CEC physical address to
 the command, for example `--physical-address 3.0.0.0` for TV HDMI 3.
 
+The version-2 client confirms TV power feedback. `input_unconfirmed` (exit 6)
+means power was confirmed but the TV did not provide input-selection evidence.
+Check the visible input separately. Update firmware and client together; older
+protocol versions are rejected before sending a power command.
+
 ## 4. Enable automatic control on Linux
 
 After both manual power commands work:
@@ -105,13 +110,17 @@ connector=card1-HDMI-A-1
 physical_address=3.0.0.0
 ```
 
-To build for another Pico GPIO or change the TV's device name:
+The generic firmware build defaults to GP11, matching the wiring above. The
+enclosed couch-PC controller is wired to GP1 (physical pin 2) with ground on
+physical pin 3, so build its firmware with:
 
 ```sh
-CEC_GPIO=7 CEC_OSD_NAME="Living Room PC" ./tools/build-firmware
+CEC_GPIO=1 ./tools/build-firmware
 ```
 
-Only the original Pico on GP11 has been hardware-tested so far.
+Set `CEC_GPIO` to match the wire for other custom setups. The firmware reports
+its GPIO in `tv protocol` and `show cec`; confirm the value before connecting
+the CEC cable.
 
 ## Help and project status
 
@@ -129,10 +138,10 @@ and native clients for more operating systems are welcome.
 
 | TV | CEC name | Connection | Host test | Standby | Wake | Select input |
 | --- | --- | --- | --- | --- | --- | --- |
-| Older Samsung Smart TV (exact model unknown, replacement mainboard) | Anynet+ | CEC on HDMI 2, video on HDMI 3 | Fedora, manual commands | Yes | Yes | Yes |
+| Older Samsung Smart TV (exact model unknown, replacement mainboard) | Anynet+ | CEC on HDMI 2, video on HDMI 3 | Bazzite, three manual off/on cycles | Yes | Yes | Yes |
 
-Automatic suspend, resume, boot, and shutdown integration on Bazzite is still
-pending real-world testing. Please include the details listed in
+Real PC boot/shutdown and suspend/resume cycles still require separate
+validation. Please include the details listed in
 [CONTRIBUTING.md](CONTRIBUTING.md#compatibility-reports) when reporting another
 TV or operating system.
 

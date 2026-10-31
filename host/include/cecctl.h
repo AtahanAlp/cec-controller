@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CECCTL_PROTOCOL_VERSION 1
+#define CECCTL_PROTOCOL_VERSION 2
 #define CECCTL_REPLY_FIELD_LEN 64
 
 typedef struct {
@@ -15,6 +15,10 @@ typedef struct {
   char power[CECCTL_REPLY_FIELD_LEN];
   char firmware[CECCTL_REPLY_FIELD_LEN];
   unsigned int attempts;
+  char session[17], source[16], routing[16], phase[24];
+  uint64_t id;
+  unsigned int value, verified, elapsed_ms;
+  unsigned int on_ms, standby_ms, status_ms, gpio, ready, busy;
 } cecctl_reply_t;
 
 bool cecctl_valid_physical_address(uint16_t address);

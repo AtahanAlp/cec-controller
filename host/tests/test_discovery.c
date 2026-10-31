@@ -96,6 +96,17 @@ static void run_detect(const char *program, const char *directory, const char *s
   assert(strstr(buffer, expected) != NULL);
 }
 
+static void expect_failure(const char *program, const char *directory, const char *state_file) {
+  pid_t child = fork(); assert(child >= 0);
+  if (!child) {
+    execl(program, program, "--config", "/nonexistent", "--sysfs-root", directory,
+          "--state-file", state_file, "detect", (char *)NULL);
+    _exit(20);
+  }
+  int status; assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 3);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   char directory[] = "/tmp/cecctl-discovery-XXXXXX";
@@ -108,10 +119,34 @@ int main(int argc, char **argv) {
   run_detect(argv[1], directory, state_file,
              "physical_address=2.0.0.0 source=edid connector=card0-HDMI-A-1");
 
+  /* Ambiguous live outputs must never fall back to the valid cache. */
+  char second[PATH_MAX], link_path[PATH_MAX];
+  assert(snprintf(second, sizeof(second), "%s/card0-HDMI-A-2", directory) < (int)sizeof(second));
+  assert(mkdir(second, 0700) == 0);
+  for (unsigned i = 0; i < 2; i++) {
+    const char *file = i ? "edid" : "status";
+    char target[64]; assert(snprintf(target, sizeof(target), "../card0-HDMI-A-1/%s", file) < (int)sizeof(target));
+    assert(snprintf(link_path, sizeof(link_path), "%s/%s", second, file) < (int)sizeof(link_path));
+    assert(symlink(target, link_path) == 0);
+  }
+  expect_failure(argv[1], directory, state_file);
+  for (unsigned i = 0; i < 2; i++) {
+    assert(snprintf(link_path, sizeof(link_path), "%s/%s", second, i ? "edid" : "status") < (int)sizeof(link_path));
+    assert(unlink(link_path) == 0);
+  }
+  assert(rmdir(second) == 0);
+
   char path[PATH_MAX];
   assert(snprintf(path, sizeof(path), "%s/card0-HDMI-A-1/status", directory)
          < (int)sizeof(path));
   assert(unlink(path) == 0);
+  /* The saved connector alone is insufficient when a different EDID is present. */
+  assert(snprintf(path, sizeof(path), "%s/card0-HDMI-A-1/edid", directory) < (int)sizeof(path));
+  int edid_fd = open(path, O_RDWR); assert(edid_fd >= 0);
+  uint8_t first; assert(pread(edid_fd, &first, 1, 12) == 1);
+  uint8_t changed = first ^ 1; assert(pwrite(edid_fd, &changed, 1, 12) == 1);
+  expect_failure(argv[1], directory, state_file);
+  assert(pwrite(edid_fd, &first, 1, 12) == 1); assert(close(edid_fd) == 0);
   run_detect(argv[1], directory, state_file, "physical_address=2.0.0.0 source=cache");
 
   assert(snprintf(path, sizeof(path), "%s/card0-HDMI-A-1/edid", directory)

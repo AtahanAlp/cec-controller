@@ -10,6 +10,8 @@
 - native protocol, EDID, serial, and CEC-sequence tests;
 - physical validation on an older Samsung Anynet+ TV;
 - successful standby, wake, and automatic selection of the PC's HDMI input.
+- bounded, confirmed power transitions with single-operation ownership and
+  watchdog recovery.
 
 The verified circuit uses only CEC and CEC ground. DDC, HDMI +5 V, and an
 inline video-cable tap were not needed.

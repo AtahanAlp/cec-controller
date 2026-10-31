@@ -8,6 +8,7 @@
 
 #include "cec-config.h"
 #include "nvs.h"
+#include "cec-frame.h"
 
 typedef struct __attribute__((packed)) {
   uint8_t version;
@@ -54,7 +55,7 @@ static bool load_config(const pico_cec_nvs_t *nvs, cec_config_t *config) {
     config->device_type = CEC_CONFIG_DEVICE_TYPE_PLAYBACK;
   }
   memcpy(config->osd_name, nvs->config.osd_name, sizeof(nvs->config.osd_name));
-  return true;
+  return cec_config_valid(config);
 }
 
 bool nvs_read_config(cec_config_t *config) {
@@ -65,7 +66,11 @@ bool nvs_read_config(cec_config_t *config) {
       || nvs->header.version != CEC_CONFIG_VERSION) {
     return false;
   }
-  return load_config(nvs, config);
+  if (!load_config(nvs, config)) {
+    cec_config_set_default(config);
+    return false;
+  }
+  return true;
 }
 
 void nvs_load_config(cec_config_t *config) {
@@ -78,6 +83,7 @@ void nvs_load_config(cec_config_t *config) {
 }
 
 bool nvs_save_config(const cec_config_t *config) {
+  if (!cec_config_valid(config)) return false;
   pico_cec_nvs_t nvs = {0};
 
   if (sizeof(nvs) > CEC_NVS_LEN) {
@@ -101,6 +107,10 @@ bool nvs_save_config(const cec_config_t *config) {
                                 : (sectors + 1) * FLASH_SECTOR_SIZE;
 
   uint32_t irqs = save_and_disable_interrupts();
+  if (!cec_frame_idle()) {
+    restore_interrupts(irqs);
+    return false;
+  }
   flash_range_erase(nvs_get_flash_address(), erase_size);
   flash_range_program(nvs_get_flash_address(), (uint8_t *)&nvs, sizeof(nvs));
   restore_interrupts(irqs);

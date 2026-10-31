@@ -3,6 +3,9 @@
 
 #include "bsp/board.h"
 #include "pico/stdlib.h"
+#include "hardware/watchdog.h"
+#include "pico/bootrom.h"
+#include "cec-health.h"
 
 #include "pico-cec/config.h"
 
@@ -14,7 +17,30 @@
 #include "usb-device.h"
 #include "ws2812.h"
 
+static void health_task(void *context) {
+  (void)context;
+  uint32_t boot = (uint32_t)(time_us_64() / 1000);
+  while (true) {
+    uint32_t now = (uint32_t)(time_us_64() / 1000);
+    if (cec_health_fresh(now, boot, cec_heartbeat_ms(), cdc_heartbeat_ms())) {
+      watchdog_update();
+      if ((uint32_t)(now - boot) > 30000) watchdog_hw->scratch[1] = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
 int main() {
+  bool expired = watchdog_enable_caused_reboot();
+  if (!expired || watchdog_hw->scratch[0] != 0x43454332) watchdog_hw->scratch[1] = 0;
+  if (expired && ++watchdog_hw->scratch[1] >= 2) {
+    watchdog_disable();
+    gpio_init(CEC_PIN); gpio_disable_pulls(CEC_PIN); gpio_set_dir(CEC_PIN, GPIO_IN);
+    /* Keep an enclosed unit recoverable over USB after an unexpected fault. */
+    reset_usb_boot(0, 0);
+  }
+  watchdog_hw->scratch[0] = 0x43454332;
+  watchdog_enable(8000, true);
   static StackType_t stackLED[LED_STACK_SIZE];
   static StackType_t stackCEC[CEC_STACK_SIZE];
   static StackType_t stackCDC[CDC_STACK_SIZE];
@@ -50,6 +76,10 @@ int main() {
   (void)xCDCTask;
 
   cec_log_init(cdc_log);
+
+  static StackType_t health_stack[256];
+  static StaticTask_t health_tcb;
+  xTaskCreateStatic(health_task, "health", 256, NULL, 1, health_stack, &health_tcb);
 
   vTaskStartScheduler();
 

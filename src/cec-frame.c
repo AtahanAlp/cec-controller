@@ -1,322 +1,327 @@
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
-
 #include "pico/stdlib.h"
-
+#include "hardware/sync.h"
+#include "FreeRTOS.h"
+#include "queue.h"
 #include "cec-frame.h"
 #include "cec-log.h"
+#include "cec-validate.h"
 
 TaskHandle_t xCECTask;
+#define RX_QUEUE_LEN 4
+#define EDGES (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL)
 
-#define CEC_BUS_IDLE_TIMEOUT_MS (1000)
-/* A maximum-length 16-byte CEC frame takes just under 400 ms on the wire. */
-#define CEC_FRAME_TX_TIMEOUT_MS (500)
+typedef struct { cec_message_t message; uint64_t at; } received_t;
+static StaticQueue_t rx_queue_static;
+static uint8_t rx_storage[RX_QUEUE_LEN * sizeof(received_t)];
+static QueueHandle_t rx_queue;
+static cec_frame_stats_t stats;
+static volatile uint64_t last_edge;
+static uint64_t received_at;
+static uint64_t sent_at;
+static alarm_id_t ack_alarm = -1;
+static uint8_t address = 0x0f;
 
-static cec_message_t rx_message = {.data = {0x0}, .len = 0};
-static cec_frame_t rx_frame = {.message = &rx_message};
+typedef enum { RX_START, RX_START_RISE, RX_BIT_FALL, RX_BIT_RISE,
+               RX_EOM_FALL, RX_EOM_RISE, RX_ACK_FALL, RX_ACK_RISE } rx_state_t;
+static struct {
+  rx_state_t state;
+  cec_message_t message;
+  uint64_t start, began;
+  unsigned bit;
+  bool first, eom, ack;
+} rx;
 
-/* CEC statistics. */
-static cec_frame_stats_t cec_stats;
-
-/**
- * Calculate next offset as time since boot.
- */
-static uint64_t time_next(uint64_t start, uint64_t next) {
-  return (next - (time_us_64() - start));
+static void rx_reset(void) {
+  if (ack_alarm >= 0) cancel_alarm(ack_alarm);
+  ack_alarm = -1;
+  gpio_set_dir(CEC_PIN, GPIO_IN);
+  rx.state = RX_START;
+  rx.message.len = 0;
+  rx.bit = 0;
 }
 
-/**
- * Pull the CEC line high at the specified time.
- */
-static int64_t ack_high(alarm_id_t alarm, void *user_data) {
-  gpio_set_dir(CEC_PIN, GPIO_IN);
+static void rx_abort(void) { stats.rx_abort_frames++; rx_reset(); }
 
+static int64_t ack_release(alarm_id_t id, void *context) {
+  (void)id; (void)context;
+  ack_alarm = -1;
+  gpio_set_dir(CEC_PIN, GPIO_IN);
   return 0;
 }
 
+static bool in_range(uint64_t n, uint64_t minimum, uint64_t maximum) {
+  return n >= minimum && n <= maximum;
+}
+
 static void frame_rx_isr(uint gpio, uint32_t events) {
-  uint64_t low_time = 0;
-  gpio_acknowledge_irq(gpio, events);
-  gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-  // printf("state = %d, byte = %d, bit = %d\n", rx_frame.state, rx_frame.byte, rx_frame.bit);
-  switch (rx_frame.state) {
-    case CEC_FRAME_STATE_START_LOW:
-      rx_frame.start = time_us_64();
-      rx_frame.state = CEC_FRAME_STATE_START_HIGH;
-      gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE, true);
-      return;
-    case CEC_FRAME_STATE_START_HIGH:
-      low_time = time_us_64() - rx_frame.start;
-      if (low_time >= 3500 && low_time <= 3900) {
-        rx_frame.first = true;
-        rx_frame.byte = 0;
-        rx_frame.bit = 0;
-        rx_frame.state = CEC_FRAME_STATE_DATA_LOW;
-        gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_FALL, true);
-      } else {
-        rx_frame.state = CEC_FRAME_STATE_ABORT;
-        xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_ABORT, eSetBits, NULL);
+  if (gpio != CEC_PIN) return;
+  const uint64_t now = time_us_64();
+  last_edge = now;
+  if ((events & EDGES) == EDGES) { rx_abort(); return; }
+  bool falling = (events & GPIO_IRQ_EDGE_FALL) != 0;
+  bool expect_fall = rx.state == RX_START || rx.state == RX_BIT_FALL
+                  || rx.state == RX_EOM_FALL || rx.state == RX_ACK_FALL;
+  if (falling != expect_fall) return;
+  if (rx.state != RX_START && now - rx.began > 450000) { rx_abort(); return; }
+  uint64_t duration = now - rx.start;
+  switch (rx.state) {
+    case RX_START:
+      memset(&rx.message, 0, sizeof(rx.message));
+      rx.start = rx.began = now;
+      rx.first = true; rx.ack = false; rx.bit = 0;
+      rx.state = RX_START_RISE;
+      break;
+    case RX_START_RISE:
+      if (!in_range(duration, 3500, 3900)) { rx_abort(); return; }
+      rx.state = RX_BIT_FALL;
+      break;
+    case RX_BIT_FALL:
+    case RX_EOM_FALL:
+    case RX_ACK_FALL: {
+      if (!in_range(duration, rx.first ? 4300 : 2050, rx.first ? 4700 : 2750)) {
+        rx_abort(); return;
       }
-      return;
-    case CEC_FRAME_STATE_EOM_LOW:
-      rx_frame.byte++;
-      rx_frame.bit = 0;
-    case CEC_FRAME_STATE_DATA_LOW: {
-      uint64_t min_time = rx_frame.first ? 4300 : 2050;
-      uint64_t max_time = rx_frame.first ? 4700 : 2750;
-      uint64_t bit_time = time_us_64() - rx_frame.start;
-      if (bit_time >= min_time && bit_time <= max_time) {
-        rx_frame.start = time_us_64();
-        if (rx_frame.state == CEC_FRAME_STATE_EOM_LOW) {
-          rx_frame.state = CEC_FRAME_STATE_EOM_HIGH;
-        } else {
-          rx_frame.state = CEC_FRAME_STATE_DATA_HIGH;
+      rx.first = false; rx.start = now;
+      if (rx.state == RX_BIT_FALL) {
+        if (rx.message.len >= CEC_FRAME_MAX_LEN) { rx_abort(); return; }
+        rx.state = RX_BIT_RISE;
+      } else if (rx.state == RX_EOM_FALL) {
+        rx.state = RX_EOM_RISE;
+      } else {
+        rx.state = RX_ACK_RISE;
+        if ((rx.message.header & 15) == address && address < 15) {
+          gpio_set_dir(CEC_PIN, GPIO_OUT);
+          ack_alarm = add_alarm_at(from_us_since_boot(now + 1500), ack_release, NULL, true);
+          if (ack_alarm < 0) { rx_abort(); return; }
+          rx.ack = true;
         }
-        rx_frame.first = false;
-        gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE, true);
-      } else {
-        rx_frame.state = CEC_FRAME_STATE_ABORT;
-        xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_ABORT, eSetBits, NULL);
       }
+      break;
     }
-      return;
-    case CEC_FRAME_STATE_EOM_HIGH:
-    case CEC_FRAME_STATE_DATA_HIGH:
-      low_time = time_us_64() - rx_frame.start;
-      uint8_t bit = false;
-      if (low_time >= 400 && low_time <= 800) {
-        bit = true;
-      } else if (low_time >= 1300 && low_time <= 1700) {
-        bit = false;
+    case RX_BIT_RISE:
+    case RX_EOM_RISE: {
+      bool one = in_range(duration, 400, 800);
+      if (!one && !in_range(duration, 1300, 1700)) { rx_abort(); return; }
+      if (rx.state == RX_BIT_RISE) {
+        if (rx.message.len >= CEC_FRAME_MAX_LEN) { rx_abort(); return; }
+        uint8_t *byte = &rx.message.data[rx.message.len];
+        *byte = (uint8_t)((*byte << 1) | one);
+        if (++rx.bit == 8) {
+          rx.bit = 0; rx.message.len++; rx.state = RX_EOM_FALL;
+        } else rx.state = RX_BIT_FALL;
       } else {
-        rx_frame.state = CEC_FRAME_STATE_ABORT;
-        xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_ABORT, eSetBits, NULL);
-        return;
+        rx.eom = one;
+        if (!one && rx.message.len == CEC_FRAME_MAX_LEN) { rx_abort(); return; }
+        rx.state = RX_ACK_FALL;
       }
-      if (rx_frame.state == CEC_FRAME_STATE_EOM_HIGH) {
-        rx_frame.eom = bit;
-        rx_frame.state = CEC_FRAME_STATE_ACK_LOW;
-      } else {
-        rx_frame.message->data[rx_frame.byte] <<= 1;
-        rx_frame.message->data[rx_frame.byte] |= bit ? 0x01 : 0x00;
-        rx_frame.bit++;
-        if (rx_frame.bit > 7) {
-          rx_frame.state = CEC_FRAME_STATE_EOM_LOW;
-        } else {
-          rx_frame.state = CEC_FRAME_STATE_DATA_LOW;
-        }
+      break;
+    }
+    case RX_ACK_RISE:
+      if (!in_range(duration, 400, 800) && !in_range(duration, 1300, 1700)) {
+        rx_abort(); return;
       }
-      gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_FALL, true);
-      return;
-    case CEC_FRAME_STATE_ACK_LOW:
-      rx_frame.start = time_us_64();
-      // send ack by changing ack from 1 to 0
-      uint8_t tgt_addr = rx_frame.message->data[0] & 0x0f;
-      if ((tgt_addr != 0x0f) && (tgt_addr == rx_frame.address)) {
-        rx_frame.state = CEC_FRAME_STATE_ACK_END;
-        gpio_set_dir(CEC_PIN, GPIO_OUT);  // pull low, then schedule pull high
-        add_alarm_at(from_us_since_boot(rx_frame.start + 1500), ack_high, NULL, true);
-        rx_frame.ack = true;
-      }
-      rx_frame.state = CEC_FRAME_STATE_ACK_HIGH;
-      gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE, true);
-      return;
-    case CEC_FRAME_STATE_ACK_HIGH:
-      low_time = time_us_64() - rx_frame.start;
-      if ((low_time >= 400 && low_time <= 800) || (low_time >= 1300 && low_time <= 1700)) {
-        rx_frame.state = CEC_FRAME_STATE_ACK_END;
-      } else {
-        rx_frame.state = CEC_FRAME_STATE_ABORT;
-        xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_ABORT, eSetBits, NULL);
-        return;
-      }
-      // fall through
-    case CEC_FRAME_STATE_ACK_END:
-      if (rx_frame.eom) {
-        rx_frame.state = CEC_FRAME_STATE_END;
-      } else {
-        rx_frame.state = CEC_FRAME_STATE_DATA_LOW;
-        gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_FALL, true);
-        return;
-      }
-      // finish receiving frame
-    case CEC_FRAME_STATE_END:
-    default:
-      rx_frame.message->len = rx_frame.byte;
-      xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_RX, eSetBits, NULL);
+      if (rx.eom) {
+        if (cec_message_valid(&rx.message)) {
+          received_t item = { .message = rx.message, .at = now };
+          if (xQueueSendFromISR(rx_queue, &item, NULL) == pdTRUE) {
+            stats.rx_frames++;
+            xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_RX, NOTIFY_RX_RX, eSetBits, NULL);
+          } else stats.rx_abort_frames++;
+        } else stats.rx_abort_frames++;
+        rx_reset();
+      } else rx.state = RX_BIT_FALL;
+      break;
   }
 }
 
-void cec_frame_recv(cec_message_t *message, uint8_t address) {
-  // printf("cec_frame_recv\n");
-  rx_frame.address = address;
-  rx_frame.state = CEC_FRAME_STATE_START_LOW;
-  rx_frame.ack = false;
-  memset(&rx_frame.message->data[0], 0, CEC_FRAME_MAX_LEN);
-  gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_FALL, true);
-
-  uint32_t notify = 0;
-
-  /* Wait for an RX notification: RX_RX (default), RX_ABORT or RX_TX */
-  xTaskNotifyWaitIndexed(NOTIFY_RX, 0x00, 0xffffffff, &notify, portMAX_DELAY);
-
-  if (notify == NOTIFY_RX_TX) {
-    gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-    return;
-  } else if (notify == NOTIFY_RX_ABORT) {
-    // printf("ABORT\n");
-    cec_stats.rx_abort_frames++;
-    message->len = 0;
-    return;
+void cec_frame_recv(cec_message_t *message, uint8_t own_address) {
+  uint32_t irq = save_and_disable_interrupts();
+  address = own_address;
+  if (rx.state != RX_START && (time_us_64() - last_edge > 5000
+                           || time_us_64() - rx.began > 450000)) rx_abort();
+  restore_interrupts(irq);
+  received_t item;
+  if (xQueueReceive(rx_queue, &item, 0) != pdTRUE) {
+    uint32_t events;
+    xTaskNotifyWaitIndexed(NOTIFY_RX, 0, UINT32_MAX, &events, pdMS_TO_TICKS(10));
+    if (xQueueReceive(rx_queue, &item, 0) != pdTRUE) { message->len = 0; return; }
   }
-
-  memcpy(message, rx_frame.message, rx_frame.message->len);
-  // printf("high water mark = %lu\n", uxTaskGetStackHighWaterMark(xCECTask));
-
-  message->len = rx_frame.message->len;
-  cec_log_frame(&rx_frame, true);
-
-  cec_stats.rx_frames++;
-  return;
+  *message = item.message;
+  received_at = item.at;
+  cec_frame_t log_frame = { .message = message };
+  cec_log_frame(&log_frame, true);
 }
 
-static int64_t frame_tx_callback(alarm_id_t alarm, void *user_data) {
-  cec_frame_t *frame = (cec_frame_t *)user_data;
-  uint64_t low_time = 0;
+uint64_t cec_frame_received_at(void) { return received_at; }
+uint64_t cec_frame_sent_at(void) { return sent_at; }
 
-  switch (frame->state) {
-    case CEC_FRAME_STATE_START_LOW:
-      gpio_set_dir(CEC_PIN, GPIO_OUT);
-      frame->start = time_us_64();
-      frame->state = CEC_FRAME_STATE_START_HIGH;
-      return time_next(frame->start, 3700);
-    case CEC_FRAME_STATE_START_HIGH:
-      gpio_set_dir(CEC_PIN, GPIO_IN);
-      frame->state = CEC_FRAME_STATE_DATA_LOW;
-      return time_next(frame->start, 4500);
-    case CEC_FRAME_STATE_DATA_LOW:
-      gpio_set_dir(CEC_PIN, GPIO_OUT);
-      frame->start = time_us_64();
-      low_time = (frame->message->data[frame->byte] & (1 << frame->bit)) ? 600 : 1500;
-      frame->state = CEC_FRAME_STATE_DATA_HIGH;
-      return time_next(frame->start, low_time);
-    case CEC_FRAME_STATE_DATA_HIGH:
-      gpio_set_dir(CEC_PIN, GPIO_IN);
-      if (frame->bit--) {
-        frame->state = CEC_FRAME_STATE_DATA_LOW;
-      } else {
-        frame->byte++;
-        frame->state = CEC_FRAME_STATE_EOM_LOW;
-      }
-      return time_next(frame->start, 2400);
-    case CEC_FRAME_STATE_EOM_LOW:
-      gpio_set_dir(CEC_PIN, GPIO_OUT);
-      low_time = (frame->byte < frame->message->len) ? 1500 : 600;
-      frame->start = time_us_64();
-      frame->state = CEC_FRAME_STATE_EOM_HIGH;
-      return time_next(frame->start, low_time);
-    case CEC_FRAME_STATE_EOM_HIGH:
-      gpio_set_dir(CEC_PIN, GPIO_IN);
-      frame->state = CEC_FRAME_STATE_ACK_LOW;
-      return time_next(frame->start, 2400);
-    case CEC_FRAME_STATE_ACK_LOW:
-      gpio_set_dir(CEC_PIN, GPIO_OUT);
-      frame->start = time_us_64();
-      frame->state = CEC_FRAME_STATE_ACK_HIGH;
-      return time_next(frame->start, 600);
-    case CEC_FRAME_STATE_ACK_HIGH:
-      gpio_set_dir(CEC_PIN, GPIO_IN);
-      if (frame->byte < frame->message->len) {
-        frame->bit = 7;
-        frame->state = CEC_FRAME_STATE_DATA_LOW;
-        return time_next(frame->start, 2400);
-      } else {
-        frame->state = CEC_FRAME_STATE_ACK_WAIT;
-        // middle of safe sample period (0.85ms, 1.25ms)
-        return time_next(frame->start, (850 + 1250) / 2);
-      }
-    case CEC_FRAME_STATE_ACK_WAIT:
-      // handle follower sending ack
-      if (gpio_get(CEC_PIN) == false) {
-        frame->ack = true;
-      }
-      frame->state = CEC_FRAME_STATE_END;
-      return time_next(frame->start, 2400);
-    case CEC_FRAME_STATE_END:
-    default:
-      xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_TX, 0, eIncrement, NULL);
-      return 0;
-  }
+typedef enum { TX_START_LOW, TX_START_RELEASE, TX_DATA_LOW, TX_DATA_RELEASE,
+               TX_DATA_SAMPLE, TX_DATA_END, TX_EOM_LOW, TX_EOM_RELEASE,
+               TX_ACK_LOW, TX_ACK_RELEASE, TX_ACK_SAMPLE, TX_NEXT, TX_END } tx_state_t;
+static struct {
+  cec_message_t message;
+  tx_state_t state;
+  unsigned byte, bit;
+  uint64_t start, due, deadline;
+  bool one;
+  volatile bool active;
+  volatile cec_tx_result_t result;
+} tx;
+
+static int64_t tx_finish(cec_tx_result_t result) {
+  gpio_set_dir(CEC_PIN, GPIO_IN);
+  tx.result = result; tx.active = false;
+  xTaskNotifyIndexedFromISR(xCECTask, NOTIFY_TX, 0, eIncrement, NULL);
+  return 0;
 }
 
-static cec_tx_result_t frame_tx(const cec_message_t *message) {
-  unsigned char i = 0;
-  TickType_t idle_start = xTaskGetTickCount();
+static int64_t tx_next(uint64_t offset) {
+  tx.due = tx.start + offset;
+  int64_t remaining = (int64_t)tx.due - (int64_t)time_us_64();
+  if (remaining <= 0 || tx.due >= tx.deadline) return tx_finish(CEC_TX_TIMEOUT);
+  return remaining;
+}
 
-  // wait 7 bit times of idle before sending
-  while (i < 7) {
-    if ((xTaskGetTickCount() - idle_start) >= pdMS_TO_TICKS(CEC_BUS_IDLE_TIMEOUT_MS)) {
-      cec_stats.tx_timeout_frames++;
-      cec_stats.tx_idle_timeout_frames++;
+static int64_t frame_tx_callback(alarm_id_t id, void *context) {
+  (void)id; (void)context;
+  uint64_t now = time_us_64();
+  if (!tx.active) return 0;
+  if (now >= tx.deadline || (tx.due && now > tx.due + 150)) return tx_finish(CEC_TX_TIMEOUT);
+  switch (tx.state) {
+    case TX_START_LOW:
+      gpio_set_dir(CEC_PIN, GPIO_OUT); tx.start = now;
+      sent_at = now;
+      tx.state = TX_START_RELEASE; return tx_next(3700);
+    case TX_START_RELEASE:
+      gpio_set_dir(CEC_PIN, GPIO_IN);
+      tx.state = TX_DATA_LOW; return tx_next(4500);
+    case TX_DATA_LOW:
+      tx.one = (tx.message.data[tx.byte] & (1u << tx.bit)) != 0;
+      gpio_set_dir(CEC_PIN, GPIO_OUT); tx.start = now;
+      tx.state = TX_DATA_RELEASE; return tx_next(tx.one ? 600 : 1500);
+    case TX_DATA_RELEASE:
+      gpio_set_dir(CEC_PIN, GPIO_IN);
+      tx.state = tx.one ? TX_DATA_SAMPLE : TX_DATA_END;
+      return tx_next(tx.one ? 1050 : 2400);
+    case TX_DATA_SAMPLE:
+      if (!gpio_get(CEC_PIN))
+        return tx_finish(tx.byte == 0 && tx.bit >= 4 ? CEC_TX_ARBITRATION_LOST : CEC_TX_BUS_ERROR);
+      tx.state = TX_DATA_END; return tx_next(2400);
+    case TX_DATA_END:
+      if (tx.bit) { tx.bit--; tx.state = TX_DATA_LOW; }
+      else { tx.byte++; tx.state = TX_EOM_LOW; }
+      return frame_tx_callback(id, context);
+    case TX_EOM_LOW:
+      gpio_set_dir(CEC_PIN, GPIO_OUT); tx.start = now;
+      tx.state = TX_EOM_RELEASE;
+      return tx_next(tx.byte < tx.message.len ? 1500 : 600);
+    case TX_EOM_RELEASE:
+      gpio_set_dir(CEC_PIN, GPIO_IN);
+      tx.state = TX_ACK_LOW; return tx_next(2400);
+    case TX_ACK_LOW:
+      gpio_set_dir(CEC_PIN, GPIO_OUT); tx.start = now;
+      tx.state = TX_ACK_RELEASE; return tx_next(600);
+    case TX_ACK_RELEASE:
+      gpio_set_dir(CEC_PIN, GPIO_IN);
+      tx.state = TX_ACK_SAMPLE; return tx_next(1050);
+    case TX_ACK_SAMPLE: {
+      bool low = !gpio_get(CEC_PIN);
+      bool broadcast = (tx.message.header & 15) == 15;
+      if (low == broadcast) {
+        tx.result = broadcast ? CEC_TX_BUS_ERROR : CEC_TX_NO_ACK;
+        tx.state = TX_END;
+      } else tx.state = tx.byte < tx.message.len ? TX_NEXT : TX_END;
+      return tx_next(2400);
+    }
+    case TX_NEXT:
+      tx.bit = 7; tx.state = TX_DATA_LOW;
+      return frame_tx_callback(id, context);
+    case TX_END: return tx_finish(tx.result);
+  }
+  return tx_finish(CEC_TX_BUS_ERROR);
+}
+
+bool cec_frame_idle(void) {
+  uint32_t irq = save_and_disable_interrupts();
+  bool idle = !tx.active && rx.state == RX_START && gpio_get(CEC_PIN)
+           && time_us_64() - last_edge >= 16800;
+  restore_interrupts(irq);
+  return idle;
+}
+
+cec_tx_result_t cec_frame_send_timeout(const cec_message_t *message, uint32_t timeout_ms) {
+  if (!cec_message_valid(message) || !timeout_ms) return CEC_TX_UNAVAILABLE;
+  uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
+  uint64_t idle_deadline = time_us_64() + 1000000;
+  if (idle_deadline > deadline) idle_deadline = deadline;
+  while (true) {
+    uint32_t irq = save_and_disable_interrupts();
+    if (cec_frame_idle()) {
+      gpio_set_irq_enabled(CEC_PIN, EDGES, false);
+      rx_reset();
+      restore_interrupts(irq);
+      break;
+    }
+    if (rx.state != RX_START && time_us_64() - last_edge > 5000) rx_abort();
+    restore_interrupts(irq);
+    if (time_us_64() >= idle_deadline) {
+      stats.tx_timeout_frames++; stats.tx_idle_timeout_frames++;
       return CEC_TX_TIMEOUT;
     }
-    vTaskDelay(pdMS_TO_TICKS(3));
-    if (gpio_get(CEC_PIN)) {
-      i++;
-    } else {
-      // reset
-      i = 0;
-    }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
-
-  cec_frame_t frame = {.message = (cec_message_t *)message,
-                       .bit = 7,
-                       .byte = 0,
-                       .start = 0,
-                       .ack = false,
-                       .state = CEC_FRAME_STATE_START_LOW};
+  memset(&tx, 0, sizeof(tx));
+  tx.message = *message; tx.bit = 7; tx.state = TX_START_LOW;
+  tx.result = CEC_TX_ACK; tx.active = true;
+  uint64_t frame_deadline = time_us_64() + 500000;
+  tx.deadline = frame_deadline < deadline ? frame_deadline : deadline;
   ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE, 0);
-  alarm_id_t alarm =
-      add_alarm_at(from_us_since_boot(time_us_64()), frame_tx_callback, &frame, true);
-  if (alarm < 0
-      || ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE, pdMS_TO_TICKS(CEC_FRAME_TX_TIMEOUT_MS)) == 0) {
-    if (alarm >= 0) {
-      cancel_alarm(alarm);
-    }
-    gpio_set_dir(CEC_PIN, GPIO_IN);
-    cec_stats.tx_timeout_frames++;
-    cec_stats.tx_alarm_timeout_frames++;
-    return CEC_TX_TIMEOUT;
+  alarm_id_t alarm = -1;
+  if (tx.deadline > time_us_64()) {
+    alarm = add_alarm_at(from_us_since_boot(time_us_64() + 10), frame_tx_callback, NULL, true);
   }
-  // printf("high water mark = %lu\n", uxTaskGetStackHighWaterMark(xCECTask));
-  cec_log_frame(&frame, false);
-
-  if (frame.ack) {
-    cec_stats.tx_frames++;
-    return CEC_TX_ACK;
-  } else {
-    cec_stats.tx_noack_frames++;
-    return CEC_TX_NO_ACK;
+  if (alarm < 0) tx.result = CEC_TX_TIMEOUT;
+  else {
+    int64_t remaining = (int64_t)tx.deadline - (int64_t)time_us_64();
+    if (remaining <= 0 || !ulTaskNotifyTakeIndexed(NOTIFY_TX, pdTRUE,
+          pdMS_TO_TICKS((uint32_t)((remaining + 999) / 1000)))) tx.result = CEC_TX_TIMEOUT;
   }
+  uint32_t irq = save_and_disable_interrupts();
+  tx.active = false;
+  if (alarm >= 0) cancel_alarm(alarm);
+  gpio_set_dir(CEC_PIN, GPIO_IN);
+  last_edge = time_us_64();
+  gpio_acknowledge_irq(CEC_PIN, EDGES);
+  gpio_set_irq_enabled(CEC_PIN, EDGES, true);
+  cec_tx_result_t result = tx.result;
+  if (result == CEC_TX_TIMEOUT) { stats.tx_timeout_frames++; stats.tx_alarm_timeout_frames++; }
+  else if (result == CEC_TX_NO_ACK) stats.tx_noack_frames++;
+  else if (result == CEC_TX_ARBITRATION_LOST) stats.tx_arbitration_frames++;
+  else if (result == CEC_TX_BUS_ERROR) stats.tx_bus_error_frames++;
+  else stats.tx_frames++;
+  restore_interrupts(irq);
+  cec_frame_t log_frame = { .message = &tx.message, .ack = result == CEC_TX_ACK };
+  cec_log_frame(&log_frame, false);
+  return result;
 }
 
 cec_tx_result_t cec_frame_send(const cec_message_t *message) {
-  // disable GPIO ISR for sending
-  gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-  return frame_tx(message);
+  return cec_frame_send_timeout(message, 1500);
 }
 
-void cec_frame_get_stats(cec_frame_stats_t *stats) {
-  *stats = cec_stats;
+void cec_frame_get_stats(cec_frame_stats_t *destination) {
+  uint32_t irq = save_and_disable_interrupts();
+  *destination = stats;
+  restore_interrupts(irq);
 }
 
 void cec_frame_init(void) {
-  gpio_init(CEC_PIN);
-  gpio_disable_pulls(CEC_PIN);
-  gpio_set_dir(CEC_PIN, GPIO_IN);
-
-  gpio_set_irq_callback(&frame_rx_isr);
+  rx_queue = xQueueCreateStatic(RX_QUEUE_LEN, sizeof(received_t), rx_storage, &rx_queue_static);
+  gpio_init(CEC_PIN); gpio_disable_pulls(CEC_PIN); gpio_put(CEC_PIN, false);
+  rx_reset(); last_edge = time_us_64();
+  gpio_set_irq_callback(frame_rx_isr);
   irq_set_enabled(IO_IRQ_BANK0, true);
-  gpio_set_irq_enabled(CEC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+  gpio_acknowledge_irq(CEC_PIN, EDGES);
+  gpio_set_irq_enabled(CEC_PIN, EDGES, true);
 }

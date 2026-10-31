@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.13)
 set(PROJECT pico-cec)
 set(BOARD "pico_sdk") # Configure TinyUSB use pico-sdk board configuration
 set(PICO_BOARD "pico" CACHE STRING "Raspberry Pi Pico board type.")
+set(PICOTOOL_GIT_BRANCH "a7eb3988f0645239185fadb4e25d8279478c2dbb"
+    CACHE STRING "Pinned Raspberry Pi picotool 2.2.0 source revision.")
 
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include/boards)
 
@@ -12,7 +14,7 @@ include(pico-sdk/lib/tinyusb/hw/bsp/family_support.cmake)
 family_get_project_name(PROJECT ${PROJECT})
 
 project(${PROJECT}
-  DESCRIPTION "HDMI CEC to USB HID keyboard adapter."
+  DESCRIPTION "USB HDMI CEC controller with confirmed power operations."
   LANGUAGES C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -65,6 +67,7 @@ set(PICO_CEC_SOURCES
   src/cec-log.c
   src/cec-task.c
   src/cec-user.c
+  src/cec-validate.c
   src/freertos_hook.c
   src/main.c
   src/nvs.c
@@ -120,6 +123,7 @@ target_link_libraries(${PROJECT}
   crc
   pico_stdlib
   pico_unique_id
+  pico_rand
   tinyusb_device
   tinyusb_board
   FreeRTOS-Kernel

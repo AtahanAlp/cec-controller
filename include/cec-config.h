@@ -2,6 +2,7 @@
 #define CEC_CONFIG_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifndef CEC_OSD_NAME
 #define CEC_OSD_NAME "Pico-CEC"
@@ -39,5 +40,6 @@ typedef struct {
 } cec_config_t;
 
 void cec_config_set_default(cec_config_t *config);
+bool cec_config_valid(const cec_config_t *config);
 
 #endif

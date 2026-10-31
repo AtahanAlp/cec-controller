@@ -14,6 +14,7 @@
 #include "cec-task.h"
 #include "ddc.h"
 #include "nvs.h"
+#include "cec-validate.h"
 
 /* Significantly rewritten from the initial Arduino version by Szymon Slupik:
  * https://github.com/SzymonSlupik/CEC-Tiny-Pro
@@ -53,6 +54,8 @@ static bool audio_status = false;
 typedef struct {
   cec_message_t message;
   TaskHandle_t requester;
+  uint32_t id;
+  uint64_t deadline;
 } cec_tx_request_t;
 
 /* Outbound TX queue: holds one synchronous request at a time. */
@@ -63,6 +66,33 @@ static QueueHandle_t cec_tx_queue = NULL;
 static StaticQueue_t cec_tx_queue_buf;
 static uint8_t cec_tx_queue_storage[CEC_TX_QUEUE_LEN * sizeof(cec_tx_request_t)];
 static TaskHandle_t power_status_waiter = NULL;
+static uint32_t tx_generation;
+static volatile uint32_t cancelled_tx;
+static uint64_t power_query_since;
+static uint64_t power_query_deadline;
+static bool source_active;
+static bool menu_state;
+static uint64_t next_allocate;
+static volatile uint32_t heartbeat;
+uint32_t cec_heartbeat_ms(void) { return heartbeat; }
+static uint16_t routing_address;
+static uint64_t routing_at;
+
+bool cec_ready(void) { return cec_tx_queue != NULL && laddr > 0 && laddr < 15; }
+void cec_set_source_active(bool active) {
+  taskENTER_CRITICAL(); source_active = active; if (active) active_addr = paddr; taskEXIT_CRITICAL();
+}
+bool cec_source_active(void) { return source_active; }
+bool cec_routing_confirmed(uint16_t physical, uint64_t since) {
+  taskENTER_CRITICAL();
+  bool confirmed = routing_address == physical && routing_at >= since;
+  taskEXIT_CRITICAL();
+  return confirmed;
+}
+void cec_apply_config(const cec_config_t *value) {
+  taskENTER_CRITICAL(); config = *value; laddr = 15; taskEXIT_CRITICAL();
+}
+
 
 static void cec_feature_abort(uint8_t initiator,
                               uint8_t destination,
@@ -181,42 +211,37 @@ static cec_tx_result_t cec_ping(uint8_t destination) {
 }
 
 cec_tx_result_t cec_send_msg_sync(const cec_message_t *msg, uint32_t timeout_ms) {
-  if (cec_tx_queue == NULL) {
-    return CEC_TX_UNAVAILABLE;
-  }
-
+  if (cec_tx_queue == NULL || !timeout_ms || !cec_message_valid(msg)) return CEC_TX_UNAVAILABLE;
+  taskENTER_CRITICAL();
+  tx_generation = (tx_generation + 1) & 0xffffff;
+  if (!tx_generation) tx_generation = 1;
+  uint32_t id = tx_generation;
+  taskEXIT_CRITICAL();
   cec_tx_request_t request = {
-      .message = *msg,
-      .requester = xTaskGetCurrentTaskHandle(),
+    .message = *msg, .requester = xTaskGetCurrentTaskHandle(), .id = id,
+    .deadline = time_us_64() + (uint64_t)timeout_ms * 1000,
   };
-  xTaskNotifyStateClearIndexed(NULL, CEC_CLIENT_NOTIFY_TX);
-  if (xQueueSend(cec_tx_queue, &request, pdMS_TO_TICKS(20)) != pdTRUE) {
-    return CEC_TX_UNAVAILABLE;
-  }
+  uint32_t result;
+  xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_TX, 0, UINT32_MAX, &result, 0);
+  if (xQueueSend(cec_tx_queue, &request, 0) != pdTRUE) return CEC_TX_UNAVAILABLE;
   xTaskNotifyIndexed(xCECTask, NOTIFY_RX, NOTIFY_RX_TX, eSetBits);
-
-  uint32_t result = CEC_TX_UNAVAILABLE;
-  if (xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_TX,
-                             0,
-                             UINT32_MAX,
-                             &result,
-                             pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-    return CEC_TX_TIMEOUT;
+  while (true) {
+    uint64_t now = time_us_64();
+    if (now >= request.deadline) break;
+    uint32_t remaining = (uint32_t)((request.deadline - now + 999) / 1000);
+    if (xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_TX, 0, UINT32_MAX, &result,
+                               pdMS_TO_TICKS(remaining)) == pdTRUE && (result >> 8) == id) {
+      return (cec_tx_result_t)(result & 255);
+    }
   }
-  return (cec_tx_result_t)result;
-}
-
-static void image_view_on(uint8_t initiator, uint8_t destination) {
-  cec_message_t message = {
-      .header = HEADER0(initiator, destination),
-      .opcode = CEC_ID_IMAGE_VIEW_ON,
-      .len = 2,
-  };
-
-  cec_frame_send(&message);
+  cancelled_tx = id;
+  /* The wire deadline is the same deadline; allow the owning task to finish cleanup. */
+  xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_TX, 0, UINT32_MAX, &result, pdMS_TO_TICKS(10));
+  return CEC_TX_TIMEOUT;
 }
 
 static void active_source(uint8_t initiator, uint16_t physical_address) {
+  if (!source_active || !cec_ready() || !cec_physical_address_valid(physical_address)) return;
   cec_message_t message = {
       .header = HEADER0(initiator, 0x0f),
       .opcode = CEC_ID_ACTIVE_SOURCE,
@@ -241,13 +266,15 @@ static void menu_status(uint8_t initiator, uint8_t destination, bool menu_state)
 
 static uint8_t allocate_logical_address(cec_config_t *config) {
   if (config->logical_address != 0x00 && config->logical_address != 0x0f) {
-    return config->logical_address;
+    return cec_ping(config->logical_address) == CEC_TX_NO_ACK ? config->logical_address : 15;
   }
 
   // Treat 0x00 or 0x0f as auto-allocate
-  uint8_t a;
+  uint8_t a = 0x0f;
+  if (config->device_type >= NUM_TYPES) return a;
   for (unsigned int i = 0; i < NUM_LADDRESS; i++) {
     a = laddress[config->device_type][i];
+    if (a == 0x0f) break;
     cec_log_submitf("Attempting to allocate logical address 0x%01hhx"_LOG_BR, a);
     cec_tx_result_t result = cec_ping(a);
     if (result == CEC_TX_NO_ACK) {
@@ -284,263 +311,286 @@ void cec_set_physical_address(uint16_t physical_address) {
 }
 
 cec_power_query_result_t cec_query_power_status(uint8_t *power_status, uint32_t timeout_ms) {
-  if (power_status == NULL) {
-    return CEC_POWER_QUERY_UNAVAILABLE;
-  }
-
+  if (!power_status || !timeout_ms || !cec_ready()) return CEC_POWER_QUERY_UNAVAILABLE;
   TaskHandle_t current = xTaskGetCurrentTaskHandle();
-  xTaskNotifyStateClearIndexed(NULL, CEC_CLIENT_NOTIFY_POWER);
+  uint32_t result;
+  xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_POWER, 0, UINT32_MAX, &result, 0);
+  uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
   taskENTER_CRITICAL();
+  if (power_status_waiter != NULL) { taskEXIT_CRITICAL(); return CEC_POWER_QUERY_UNAVAILABLE; }
   power_status_waiter = current;
+  power_query_since = time_us_64(); power_query_deadline = deadline;
   taskEXIT_CRITICAL();
-
-  cec_message_t query = {
-      .header = HEADER0(laddr, 0x00),
-      .opcode = CEC_ID_GIVE_DEVICE_POWER_STATUS,
-      .len = 2,
-  };
-  cec_tx_result_t tx = cec_send_msg_sync(&query, CEC_CONTROL_TX_TIMEOUT_MS);
-  if (tx != CEC_TX_ACK) {
-    taskENTER_CRITICAL();
-    if (power_status_waiter == current) {
-      power_status_waiter = NULL;
-    }
-    taskEXIT_CRITICAL();
-    if (tx == CEC_TX_NO_ACK) {
-      return CEC_POWER_QUERY_NO_ACK;
-    }
-    return tx == CEC_TX_TIMEOUT ? CEC_POWER_QUERY_TX_TIMEOUT : CEC_POWER_QUERY_UNAVAILABLE;
-  }
-
-  uint32_t result = 0;
-  BaseType_t received = xTaskNotifyWaitIndexed(
-      CEC_CLIENT_NOTIFY_POWER, 0, UINT32_MAX, &result, pdMS_TO_TICKS(timeout_ms));
+  cec_message_t query = { .header = HEADER0(laddr, 0), .opcode = CEC_ID_GIVE_DEVICE_POWER_STATUS, .len = 2 };
+  cec_tx_result_t tx_result = cec_send_msg_sync(&query, timeout_ms < 1500 ? timeout_ms : 1500);
+  uint64_t now = time_us_64();
+  if (tx_result == CEC_TX_ACK && now < deadline) {
+    uint32_t remaining = (uint32_t)((deadline - now + 999) / 1000);
+    if (xTaskNotifyWaitIndexed(CEC_CLIENT_NOTIFY_POWER, 0, UINT32_MAX, &result,
+                               pdMS_TO_TICKS(remaining)) != pdTRUE) result = 0;
+  } else result = 0;
   taskENTER_CRITICAL();
-  if (power_status_waiter == current) {
-    power_status_waiter = NULL;
-  }
+  if (power_status_waiter == current) power_status_waiter = NULL;
   taskEXIT_CRITICAL();
-  if (received != pdTRUE || result == 0) {
-    return CEC_POWER_QUERY_RESPONSE_TIMEOUT;
-  }
+  if (result >= 0x100) return CEC_POWER_QUERY_UNSUPPORTED;
+  if (result >= 1 && result <= 4) { *power_status = (uint8_t)(result - 1); return CEC_POWER_QUERY_OK; }
+  if (tx_result == CEC_TX_NO_ACK) return CEC_POWER_QUERY_NO_ACK;
+  if (tx_result != CEC_TX_ACK) return tx_result == CEC_TX_UNAVAILABLE ? CEC_POWER_QUERY_UNAVAILABLE : CEC_POWER_QUERY_TX_TIMEOUT;
+  return CEC_POWER_QUERY_RESPONSE_TIMEOUT;
+}
 
-  *power_status = (uint8_t)(result - 1);
-  return CEC_POWER_QUERY_OK;
+static void dispatch_message(cec_message_t msg) {
+  if (msg.len > 1 && cec_message_valid(&msg) && cec_ready()) {
+    uint64_t arrived = cec_frame_received_at();
+    uint8_t initiator = (msg.header & 0xf0) >> 4;
+    uint8_t destination = msg.header & 0x0f;
+    if (initiator == laddr) {
+      /* Our own TX is not received: another initiator is using our address. */
+      laddr = 15; source_active = false; next_allocate = time_us_64() + 2000000;
+      return;
+    }
+
+    switch (msg.opcode) {
+      case CEC_ID_IMAGE_VIEW_ON:
+        break;
+      case CEC_ID_TEXT_VIEW_ON:
+        break;
+      case CEC_ID_STANDBY:
+        if (destination == laddr || destination == 0x0f) {
+          active_addr = 0x0000;
+          source_active = false;
+          blink_set_blink(BLINK_STATE_BLUE_2HZ);
+        }
+        break;
+      case CEC_ID_SYSTEM_AUDIO_MODE_REQUEST:
+        if (destination == laddr) {
+          set_system_audio_mode(laddr, initiator, audio_status);
+        }
+        break;
+      case CEC_ID_GIVE_AUDIO_STATUS:
+        if (destination == laddr) {
+          report_audio_status(laddr, initiator, 0x32);  // volume 50%, mute off
+        }
+        break;
+      case CEC_ID_SET_SYSTEM_AUDIO_MODE:
+        if (destination == laddr || destination == 0x0f) {
+          audio_status = (msg.operand[0] == 1);
+        }
+        break;
+      case CEC_ID_GIVE_SYSTEM_AUDIO_MODE_STATUS:
+        if (destination == laddr)
+          system_audio_mode_status(laddr, initiator, audio_status);
+        break;
+      case CEC_ID_SYSTEM_AUDIO_MODE_STATUS:
+        break;
+      case CEC_ID_ROUTING_CHANGE:
+        active_addr = (msg.operand[2] << 8) | msg.operand[3];
+        if (initiator == 0) { routing_address = active_addr; routing_at = arrived; }
+        if (active_addr != paddr) source_active = false;
+        paddr = get_physical_address(&config);
+        if (!cec_ready()) laddr = allocate_logical_address(&config);
+        if (paddr == active_addr) {
+          active_source(laddr, paddr);
+        }
+        break;
+      case CEC_ID_ROUTING_INFORMATION:
+        if (initiator == 0) {
+          routing_address = (msg.operand[0] << 8) | msg.operand[1]; routing_at = arrived;
+          if (routing_address != paddr) source_active = false;
+        }
+        break;
+      case CEC_ID_ACTIVE_SOURCE:
+        if (initiator != laddr) { source_active = false; routing_address = 0xffff; routing_at = 0; }
+        active_addr = (msg.operand[0] << 8) | msg.operand[1];
+        break;
+      case CEC_ID_REPORT_PHYSICAL_ADDRESS:
+        // On broadcast receive, do the same
+        if ((initiator == 0x00) && (destination == 0x0f)) {
+          paddr = get_physical_address(&config);
+          if (!cec_ready()) laddr = allocate_logical_address(&config);
+          if (paddr != 0x0000) {
+            report_physical_address(laddr, 0x0f, paddr, config.device_type);
+          }
+        }
+        break;
+      case CEC_ID_REQUEST_ACTIVE_SOURCE:
+        if (source_active && paddr == active_addr) {
+          active_source(laddr, paddr);
+        }
+        break;
+      case CEC_ID_SET_STREAM_PATH:
+        if (source_active && paddr == ((msg.operand[0] << 8) | msg.operand[1])) {
+          active_addr = paddr;
+          active_source(laddr, paddr);
+          menu_state = true;
+          menu_status(laddr, 0x00, menu_state);
+
+          blink_set_blink(BLINK_STATE_GREEN_2HZ);
+        }
+        break;
+      case CEC_ID_DEVICE_VENDOR_ID:
+        // On broadcast receive, do the same
+        if ((initiator == 0x00) && (destination == 0x0f)) {
+          device_vendor_id(laddr, 0x0f, 0x0010FA);
+        }
+        break;
+      case CEC_ID_GIVE_DEVICE_VENDOR_ID:
+        if (destination == laddr)
+          device_vendor_id(laddr, 0x0f, 0x0010FA);
+        break;
+      case CEC_ID_MENU_STATUS:
+        break;
+      case CEC_ID_MENU_REQUEST:
+        if (destination == laddr) {
+          cec_menu_t request = msg.operand[0];
+          switch (request) {
+            case CEC_MENU_ACTIVATE:
+              menu_state = true;
+              break;
+            case CEC_MENU_DEACTIVATE:
+              menu_state = false;
+              break;
+            case CEC_MENU_QUERY:
+              break;
+          }
+          menu_status(laddr, initiator, menu_state);
+        }
+        break;
+      case CEC_ID_GIVE_DEVICE_POWER_STATUS:
+        if (destination == laddr)
+          report_power_status(laddr, initiator, active_addr != paddr);
+  #if 0
+        /* Hack for Google Chromecast to force it sending V+/V- if no CEC TV is present */
+        if (destination == 0)
+          report_power_status(0, initiator, 0x00);
+  #endif
+        break;
+      case CEC_ID_REPORT_POWER_STATUS:
+        if (initiator == 0x00 && (destination == laddr || destination == 15)
+            && msg.operand[0] <= 3 && arrived >= power_query_since && arrived <= power_query_deadline) {
+          TaskHandle_t waiter = NULL;
+          taskENTER_CRITICAL();
+          waiter = power_status_waiter;
+          power_status_waiter = NULL;
+          taskEXIT_CRITICAL();
+          if (waiter != NULL) {
+            xTaskNotifyIndexed(waiter,
+                               CEC_CLIENT_NOTIFY_POWER,
+                               (uint32_t)msg.operand[0] + 1,
+                               eSetValueWithOverwrite);
+          }
+        }
+        break;
+      case CEC_ID_GET_MENU_LANGUAGE:
+        break;
+      case CEC_ID_INACTIVE_SOURCE:
+        break;
+      case CEC_ID_CEC_VERSION:
+        break;
+      case CEC_ID_GET_CEC_VERSION:
+        if (destination == laddr) {
+          report_cec_version(laddr, initiator);
+        }
+        break;
+      case CEC_ID_GIVE_OSD_NAME:
+        if (destination == laddr)
+          set_osd_name(laddr, initiator);
+        break;
+      case CEC_ID_SET_OSD_NAME:
+        break;
+      case CEC_ID_GIVE_PHYSICAL_ADDRESS:
+        if (destination == laddr && paddr != 0x0000)
+          report_physical_address(laddr, 0x0f, paddr, config.device_type);
+        break;
+      case CEC_ID_USER_CONTROL_PRESSED:
+        if (destination == laddr) {
+          blink_set(BLINK_STATE_GREEN_ON);
+        }
+        break;
+      case CEC_ID_USER_CONTROL_RELEASED:
+        if (destination == laddr) {
+          blink_set(BLINK_STATE_OFF);
+        }
+        break;
+      case CEC_ID_ABORT:
+        if (destination == laddr) {
+          cec_feature_abort(laddr, initiator, msg.opcode, CEC_ABORT_REFUSED);
+        }
+        break;
+      case CEC_ID_FEATURE_ABORT:
+        if (initiator == 0 && destination == laddr && msg.operand[0] == CEC_ID_GIVE_DEVICE_POWER_STATUS
+            && arrived >= power_query_since && arrived <= power_query_deadline) {
+          taskENTER_CRITICAL();
+          TaskHandle_t waiter = power_status_waiter; power_status_waiter = NULL;
+          taskEXIT_CRITICAL();
+          if (waiter) xTaskNotifyIndexed(waiter, CEC_CLIENT_NOTIFY_POWER, 0x100u + msg.operand[1], eSetValueWithOverwrite);
+        }
+        break;
+      case CEC_ID_VENDOR_COMMAND_WITH_ID:
+        break;
+      default:
+        if (destination == laddr) {
+          cec_feature_abort(laddr, initiator, msg.opcode, CEC_ABORT_UNRECOGNIZED);
+        }
+        break;
+    }
+  }
+}
+
+static bool service_tx_request(void) {
+  cec_tx_request_t request;
+  if (xQueueReceive(cec_tx_queue, &request, 0) == pdTRUE) {
+    cec_tx_result_t result = CEC_TX_TIMEOUT;
+    uint64_t now = time_us_64();
+    if (request.id != cancelled_tx && now < request.deadline
+        && (request.message.header >> 4) == laddr && cec_ready()) {
+      uint32_t remaining = (uint32_t)((request.deadline - now) / 1000);
+      bool query = request.message.opcode == CEC_ID_GIVE_DEVICE_POWER_STATUS && request.message.len > 1;
+      if (query) power_query_since = UINT64_MAX;
+      result = cec_frame_send_timeout(&request.message, remaining);
+      if (query && result == CEC_TX_ACK) power_query_since = cec_frame_sent_at();
+    }
+    xTaskNotifyIndexed(request.requester, CEC_CLIENT_NOTIFY_TX,
+                       (request.id << 8) | (uint32_t)result, eSetValueWithOverwrite);
+    return true;
+  }
+  return false;
 }
 
 void cec_task(void *param) {
   (void)param;
 
-  /* Menu state. */
-  bool menu_state = false;
+  menu_state = false;
 
   // load configuration
   nvs_load_config(&config);
 
-  cec_tx_queue = xQueueCreateStatic(CEC_TX_QUEUE_LEN, sizeof(cec_tx_request_t),
-                                    cec_tx_queue_storage, &cec_tx_queue_buf);
-
   // pause for EDID to settle
-  vTaskDelay(pdMS_TO_TICKS(config.edid_delay_ms));
+#if CEC_ENABLE_DDC
+  for (uint32_t elapsed = 0; elapsed < config.edid_delay_ms; elapsed += 100) {
+    heartbeat = (uint32_t)(time_us_64() / 1000);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+#endif
 
   cec_frame_init();
 
   paddr = get_physical_address(&config);
   laddr = allocate_logical_address(&config);
-  uint8_t no_active = 0;
+  cec_tx_queue = xQueueCreateStatic(CEC_TX_QUEUE_LEN, sizeof(cec_tx_request_t),
+                                    cec_tx_queue_storage, &cec_tx_queue_buf);
+  next_allocate = time_us_64() + 2000000;
 
   while (true) {
+    heartbeat = (uint32_t)(time_us_64() / 1000);
     cec_message_t msg = {0x0};
 
     cec_frame_recv(&msg, laddr);
 
-    cec_tx_request_t tx_request;
-    if (xQueueReceive(cec_tx_queue, &tx_request, 0) == pdTRUE) {
-      cec_tx_result_t result = cec_frame_send(&tx_request.message);
-      xTaskNotifyIndexed(tx_request.requester,
-                         CEC_CLIENT_NOTIFY_TX,
-                         (uint32_t)result,
-                         eSetValueWithOverwrite);
-      continue;
-    }
-
-    if (msg.len > 1) {
-      uint8_t initiator = (msg.header & 0xf0) >> 4;
-      uint8_t destination = msg.header & 0x0f;
-
-      switch (msg.opcode) {
-        case CEC_ID_IMAGE_VIEW_ON:
-          break;
-        case CEC_ID_TEXT_VIEW_ON:
-          break;
-        case CEC_ID_STANDBY:
-          if (destination == laddr || destination == 0x0f) {
-            active_addr = 0x0000;
-            blink_set_blink(BLINK_STATE_BLUE_2HZ);
-          }
-          break;
-        case CEC_ID_SYSTEM_AUDIO_MODE_REQUEST:
-          if (destination == laddr) {
-            set_system_audio_mode(laddr, initiator, audio_status);
-          }
-          break;
-        case CEC_ID_GIVE_AUDIO_STATUS:
-          if (destination == laddr) {
-            report_audio_status(laddr, initiator, 0x32);  // volume 50%, mute off
-          }
-          break;
-        case CEC_ID_SET_SYSTEM_AUDIO_MODE:
-          if (destination == laddr || destination == 0x0f) {
-            audio_status = (msg.operand[0] == 1);
-          }
-          break;
-        case CEC_ID_GIVE_SYSTEM_AUDIO_MODE_STATUS:
-          if (destination == laddr)
-            system_audio_mode_status(laddr, initiator, audio_status);
-          break;
-        case CEC_ID_SYSTEM_AUDIO_MODE_STATUS:
-          break;
-        case CEC_ID_ROUTING_CHANGE:
-          active_addr = (msg.operand[2] << 8) | msg.operand[3];
-          paddr = get_physical_address(&config);
-          laddr = allocate_logical_address(&config);
-          if (paddr == active_addr) {
-            image_view_on(laddr, 0x00);
-            active_source(laddr, paddr);
-            no_active = 0;
-          }
-          break;
-        case CEC_ID_ACTIVE_SOURCE:
-          active_addr = (msg.operand[0] << 8) | msg.operand[1];
-          no_active = 0;
-          break;
-        case CEC_ID_REPORT_PHYSICAL_ADDRESS:
-          // On broadcast receive, do the same
-          if ((initiator == 0x00) && (destination == 0x0f)) {
-            paddr = get_physical_address(&config);
-            laddr = allocate_logical_address(&config);
-            if (paddr != 0x0000) {
-              report_physical_address(laddr, 0x0f, paddr, config.device_type);
-            }
-          }
-          break;
-        case CEC_ID_REQUEST_ACTIVE_SOURCE:
-          no_active++;
-          if (paddr == active_addr || no_active > 2) {
-            image_view_on(laddr, 0x00);
-            active_source(laddr, paddr);
-            no_active = 0;
-          }
-          break;
-        case CEC_ID_SET_STREAM_PATH:
-          if (paddr == ((msg.operand[0] << 8) | msg.operand[1])) {
-            active_addr = paddr;
-            image_view_on(laddr, 0x00);
-            active_source(laddr, paddr);
-            menu_state = true;
-            menu_status(laddr, 0x00, menu_state);
-            no_active = 0;
-            blink_set_blink(BLINK_STATE_GREEN_2HZ);
-          }
-          break;
-        case CEC_ID_DEVICE_VENDOR_ID:
-          // On broadcast receive, do the same
-          if ((initiator == 0x00) && (destination == 0x0f)) {
-            device_vendor_id(laddr, 0x0f, 0x0010FA);
-          }
-          break;
-        case CEC_ID_GIVE_DEVICE_VENDOR_ID:
-          if (destination == laddr)
-            device_vendor_id(laddr, 0x0f, 0x0010FA);
-          break;
-        case CEC_ID_MENU_STATUS:
-          break;
-        case CEC_ID_MENU_REQUEST:
-          if (destination == laddr) {
-            cec_menu_t request = msg.operand[0];
-            switch (request) {
-              case CEC_MENU_ACTIVATE:
-                menu_state = true;
-                break;
-              case CEC_MENU_DEACTIVATE:
-                menu_state = false;
-                break;
-              case CEC_MENU_QUERY:
-                break;
-            }
-            menu_status(laddr, initiator, menu_state);
-          }
-          break;
-        case CEC_ID_GIVE_DEVICE_POWER_STATUS:
-          if (destination == laddr)
-            report_power_status(laddr, initiator, active_addr != paddr);
-#if 0
-          /* Hack for Google Chromecast to force it sending V+/V- if no CEC TV is present */
-          if (destination == 0)
-            report_power_status(0, initiator, 0x00);
-#endif
-          break;
-        case CEC_ID_REPORT_POWER_STATUS:
-          if (initiator == 0x00 && destination == laddr && msg.len >= 3) {
-            TaskHandle_t waiter = NULL;
-            taskENTER_CRITICAL();
-            waiter = power_status_waiter;
-            power_status_waiter = NULL;
-            taskEXIT_CRITICAL();
-            if (waiter != NULL) {
-              xTaskNotifyIndexed(waiter,
-                                 CEC_CLIENT_NOTIFY_POWER,
-                                 (uint32_t)msg.operand[0] + 1,
-                                 eSetValueWithOverwrite);
-            }
-          }
-          break;
-        case CEC_ID_GET_MENU_LANGUAGE:
-          break;
-        case CEC_ID_INACTIVE_SOURCE:
-          break;
-        case CEC_ID_CEC_VERSION:
-          break;
-        case CEC_ID_GET_CEC_VERSION:
-          if (destination == laddr) {
-            report_cec_version(laddr, initiator);
-          }
-          break;
-        case CEC_ID_GIVE_OSD_NAME:
-          if (destination == laddr)
-            set_osd_name(laddr, initiator);
-          break;
-        case CEC_ID_SET_OSD_NAME:
-          break;
-        case CEC_ID_GIVE_PHYSICAL_ADDRESS:
-          if (destination == laddr && paddr != 0x0000)
-            report_physical_address(laddr, 0x0f, paddr, config.device_type);
-          break;
-        case CEC_ID_USER_CONTROL_PRESSED:
-          if (destination == laddr) {
-            blink_set(BLINK_STATE_GREEN_ON);
-          }
-          break;
-        case CEC_ID_USER_CONTROL_RELEASED:
-          if (destination == laddr) {
-            blink_set(BLINK_STATE_OFF);
-          }
-          break;
-        case CEC_ID_ABORT:
-          if (destination == laddr) {
-            cec_feature_abort(laddr, initiator, msg.opcode, CEC_ABORT_REFUSED);
-          }
-          break;
-        case CEC_ID_FEATURE_ABORT:
-          break;
-        case CEC_ID_VENDOR_COMMAND_WITH_ID:
-          break;
-        default:
-          if (destination == laddr) {
-            cec_feature_abort(laddr, initiator, msg.opcode, CEC_ABORT_UNRECOGNIZED);
-          }
-          break;
-      }
+    dispatch_message(msg);
+    if (!service_tx_request() && !cec_ready() && time_us_64() >= next_allocate && cec_frame_idle()) {
+      laddr = allocate_logical_address(&config);
+      next_allocate = time_us_64() + 2000000;
     }
   }
 }

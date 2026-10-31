@@ -59,11 +59,17 @@ typedef struct {
   uint32_t tx_timeout_frames;
   uint32_t tx_idle_timeout_frames;
   uint32_t tx_alarm_timeout_frames;
+  uint32_t tx_arbitration_frames;
+  uint32_t tx_bus_error_frames;
 } cec_frame_stats_t;
 
 void cec_frame_init(void);
 void cec_frame_get_stats(cec_frame_stats_t *stats);
 cec_tx_result_t cec_frame_send(const cec_message_t *message);
+cec_tx_result_t cec_frame_send_timeout(const cec_message_t *message, uint32_t timeout_ms);
+uint64_t cec_frame_received_at(void);
+uint64_t cec_frame_sent_at(void);
+bool cec_frame_idle(void);
 void cec_frame_recv(cec_message_t *message, uint8_t address);
 
 #endif

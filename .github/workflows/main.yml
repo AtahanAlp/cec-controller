@@ -31,7 +31,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: couch-cec-rp2040
-          path: build/firmware/pico-cec.uf2
+          path: |
+            build/firmware/couch-cec-*.uf2
+            build/firmware/couch-cec-*.manifest
           if-no-files-found: error
 
   release:
@@ -48,13 +50,13 @@ jobs:
 
       - name: Name and checksum firmware
         run: |
-          mv release/pico-cec.uf2 release/couch-cec-rp2040-${{ github.ref_name }}.uf2
           cd release
-          sha256sum *.uf2 > SHA256SUMS
+          sha256sum *.uf2 *.manifest > SHA256SUMS
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             release/*.uf2
+            release/*.manifest
             release/SHA256SUMS

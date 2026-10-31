@@ -2,7 +2,7 @@
 
 Use a normal HDMI cable for PC video and a second, cut cable for CEC only.
 
-| HDMI pin | Signal | Original Pico |
+| HDMI pin | Signal | Original Pico wiring |
 | --- | --- | --- |
 | 13 | CEC | GP11, physical pin 15 |
 | 17 | DDC/CEC ground | GND, physical pin 18 |
@@ -10,6 +10,10 @@ Use a normal HDMI cable for PC video and a second, cut cable for CEC only.
 ![HDMI plug wired to pins 13 and 17](images/hdmi-wiring-closeup.jpg)
 
 ![Raspberry Pi Pico pinout showing GP11 on physical pin 15 and ground on physical pin 18](images/pico-pinout.png)
+
+The enclosed couch-PC controller uses a custom connection: CEC on GP1
+(physical pin 2) and ground on physical pin 3. Build for that wiring with
+`CEC_GPIO=1 ./tools/build-firmware`; the generic firmware default is GP11.
 
 Insulate every other cut conductor separately. Do not connect the HDMI shield
 as a substitute for pin 17.
@@ -22,7 +26,8 @@ as a substitute for pin 17.
 
 Disconnect both the Pico USB and TV before testing:
 
-1. Pin 13 has continuity only to the GP11 wire.
+1. Pin 13 has continuity only to the selected GPIO wire (GP11 for the original
+   wiring above, GP1 for the enclosed couch-PC controller).
 2. Pin 17 has continuity only to the GND wire.
 3. Pins 13 and 17 are not shorted together.
 4. Neither selected wire is shorted to pin 18, another wire, or the shell.
